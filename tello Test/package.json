@@ -10,9 +10,21 @@
     "tello:test": "tsx src/test-tello.ts",
     "tello:status": "tsx src/test-tello.ts \"ドローンのステータスを確認して\"",
     "tello:takeoff": "tsx src/test-tello.ts \"ドローンを離陸させて\"",
-    "tello:land": "tsx src/test-tello.ts \"着陸して\""
+    "tello:land": "tsx src/test-tello.ts \"着陸して\"",
+    "tello:ai": "node --import tsx/esm src/tello-natural-language.ts",
+    "tello:ai:status": "node --import tsx/esm src/tello-natural-language.ts \"ドローンのステータスを確認して\"",
+    "tello:ai:takeoff": "node --import tsx/esm src/tello-natural-language.ts \"ドローンを離陸させて\"",
+    "tello:ai:land": "node --import tsx/esm src/tello-natural-language.ts \"着陸して\"",
+    "tello:ai:forward": "node --import tsx/esm src/tello-natural-language.ts \"前に100cm進んで\"",
+    "tello:ai:rotate": "node --import tsx/esm src/tello-natural-language.ts \"右に90度回転して\""
   },
-  "keywords": ["tello", "drone", "ai", "mastra", "natural-language"],
+  "keywords": [
+    "tello",
+    "drone",
+    "ai",
+    "mastra",
+    "natural-language"
+  ],
   "author": "",
   "license": "ISC",
   "type": "module",
@@ -22,17 +34,17 @@
   "dependencies": {
     "@ai-sdk/google": "^1.2.18",
     "@ai-sdk/openai": "^1.3.22",
-    "@mastra/core": "^0.10.1",
+    "@mastra/core": "^0.10.3",
     "@mastra/libsql": "^0.10.0",
     "@mastra/loggers": "^0.10.0",
     "@mastra/memory": "^0.10.1",
     "dgram": "^1.0.1",
     "tello-drone": "^3.0.6",
-    "zod": "^3.25.46"
+    "zod": "^3.25.55"
   },
   "devDependencies": {
-    "@types/node": "^22.15.29",
-    "mastra": "^0.10.1",
+    "@types/node": "^22.15.30",
+    "mastra": "^0.10.3",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }

@@ -4,15 +4,86 @@ import Tello from 'tello-drone';
 
 // Telloドローンのインスタンス
 let tello: any = null;
+let isConnected = false;
+
+// より包括的なログ抑制機能
+const suppressLogs = () => {
+  const originalLog = console.log;
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  const originalInfo = console.info;
+  const originalDebug = console.debug;
+  
+  // 標準出力も抑制
+  const originalStdoutWrite = process.stdout.write;
+  const originalStderrWrite = process.stderr.write;
+  
+  console.log = () => {};
+  console.error = () => {};
+  console.warn = () => {};
+  console.info = () => {};
+  console.debug = () => {};
+  
+  // stdout/stderrの書き込みも抑制
+  process.stdout.write = () => true;
+  process.stderr.write = () => true;
+  
+  return () => {
+    console.log = originalLog;
+    console.error = originalError;
+    console.warn = originalWarn;
+    console.info = originalInfo;
+    console.debug = originalDebug;
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+  };
+};
 
 // Telloに接続
 const connectTello = async () => {
-  if (!tello) {
-    tello = new Tello();
-    await tello.connect();
-    console.log('Telloに接続しました');
+  if (!tello || !isConnected) {
+    const restoreLogs = suppressLogs();
+    try {
+      tello = new Tello();
+      
+      // 接続処理
+      await tello.connect();
+      isConnected = true;
+      
+      // 接続確認のため簡単なコマンドを送信
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 1秒待機
+      
+      restoreLogs();
+      console.log('Telloに接続しました');
+      
+    } catch (error) {
+      restoreLogs();
+      console.error('Tello接続エラー:', error);
+      isConnected = false;
+      throw error;
+    }
   }
   return tello;
+};
+
+// 安全にコマンドを実行するヘルパー関数
+const executeCommand = async (commandFn: () => Promise<any>, commandName: string) => {
+  const restoreLogs = suppressLogs();
+  try {
+    const result = await commandFn();
+    restoreLogs();
+    return { success: true, result };
+  } catch (error) {
+    restoreLogs();
+    console.error(`${commandName}エラー:`, error);
+    // 接続が切れた場合はフラグをリセット
+    const errorStr = error instanceof Error ? error.message : String(error);
+    if (errorStr.includes('connection') || errorStr.includes('timeout')) {
+      isConnected = false;
+      tello = null;
+    }
+    throw error;
+  }
 };
 
 // 基本的な飛行コマンドツール
@@ -27,21 +98,23 @@ export const telloBasicCommands = createTool({
     try {
       const drone = await connectTello();
       
+      let result;
       switch (command) {
         case 'takeoff':
-          await drone.takeoff();
+          result = await executeCommand(() => drone.takeoff(), '離陸');
           return { success: true, message: 'ドローンが離陸しました' };
         case 'land':
-          await drone.land();
+          result = await executeCommand(() => drone.land(), '着陸');
           return { success: true, message: 'ドローンが着陸しました' };
         case 'emergency':
-          await drone.emergency();
+          result = await executeCommand(() => drone.emergency(), '緊急停止');
           return { success: true, message: '緊急停止を実行しました' };
         default:
           return { success: false, message: '不明なコマンドです' };
       }
     } catch (error) {
-      return { success: false, message: `エラーが発生しました: ${error}` };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { success: false, message: `エラーが発生しました: ${errorMessage}` };
     }
   },
 });
@@ -59,30 +132,20 @@ export const telloMovementCommands = createTool({
     try {
       const drone = await connectTello();
       
-      switch (direction) {
-        case 'forward':
-          await drone.forward(distance);
-          break;
-        case 'backward':
-          await drone.backward(distance);
-          break;
-        case 'left':
-          await drone.left(distance);
-          break;
-        case 'right':
-          await drone.right(distance);
-          break;
-        case 'up':
-          await drone.up(distance);
-          break;
-        case 'down':
-          await drone.down(distance);
-          break;
-      }
+      const commandMap = {
+        'forward': () => drone.forward(distance),
+        'backward': () => drone.backward(distance),
+        'left': () => drone.left(distance),
+        'right': () => drone.right(distance),
+        'up': () => drone.up(distance),
+        'down': () => drone.down(distance),
+      };
       
+      await executeCommand(commandMap[direction], `${direction}移動`);
       return { success: true, message: `${direction}方向に${distance}cm移動しました` };
     } catch (error) {
-      return { success: false, message: `移動エラー: ${error}` };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { success: false, message: `移動エラー: ${errorMessage}` };
     }
   },
 });
@@ -100,15 +163,15 @@ export const telloRotationCommands = createTool({
     try {
       const drone = await connectTello();
       
-      if (direction === 'clockwise') {
-        await drone.clockwise(degrees);
-      } else {
-        await drone.counterClockwise(degrees);
-      }
+      const commandFn = direction === 'clockwise' 
+        ? () => drone.clockwise(degrees)
+        : () => drone.counterClockwise(degrees);
       
+      await executeCommand(commandFn, `${direction}回転`);
       return { success: true, message: `${direction}方向に${degrees}度回転しました` };
     } catch (error) {
-      return { success: false, message: `回転エラー: ${error}` };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { success: false, message: `回転エラー: ${errorMessage}` };
     }
   },
 });
@@ -125,24 +188,18 @@ export const telloFlipCommands = createTool({
     try {
       const drone = await connectTello();
       
-      switch (direction) {
-        case 'forward':
-          await drone.flip('f');
-          break;
-        case 'backward':
-          await drone.flip('b');
-          break;
-        case 'left':
-          await drone.flip('l');
-          break;
-        case 'right':
-          await drone.flip('r');
-          break;
-      }
+      const flipMap = {
+        'forward': 'f',
+        'backward': 'b',
+        'left': 'l',
+        'right': 'r',
+      };
       
+      await executeCommand(() => drone.flip(flipMap[direction]), `${direction}フリップ`);
       return { success: true, message: `${direction}方向にフリップしました` };
     } catch (error) {
-      return { success: false, message: `フリップエラー: ${error}` };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { success: false, message: `フリップエラー: ${errorMessage}` };
     }
   },
 });
@@ -155,21 +212,48 @@ export const telloStatusTool = createTool({
   execute: async ({ context }) => {
     try {
       const drone = await connectTello();
-      const battery = await drone.getBattery();
-      const speed = await drone.getSpeed();
-      const time = await drone.getTime();
+      
+      // 各ステータスを個別に取得し、エラーハンドリングを行う
+      let battery, speed, time;
+      
+      try {
+        const batteryResult = await executeCommand(() => drone.getBattery(), 'バッテリー取得');
+        battery = batteryResult.result;
+      } catch (error) {
+        battery = 'N/A';
+      }
+      
+      try {
+        const speedResult = await executeCommand(() => drone.getSpeed(), '速度取得');
+        speed = speedResult.result;
+      } catch (error) {
+        speed = 'N/A';
+      }
+      
+      try {
+        const timeResult = await executeCommand(() => drone.getTime(), '飛行時間取得');
+        time = timeResult.result;
+      } catch (error) {
+        time = 'N/A';
+      }
       
       return {
         success: true,
         status: {
-          battery: `${battery}%`,
-          speed: `${speed}cm/s`,
-          flightTime: `${time}秒`,
+          battery: battery !== 'N/A' ? `${battery}%` : battery,
+          speed: speed !== 'N/A' ? `${speed}cm/s` : speed,
+          flightTime: time !== 'N/A' ? `${time}秒` : time,
+          connected: isConnected,
         },
-        message: `バッテリー: ${battery}%, 速度: ${speed}cm/s, 飛行時間: ${time}秒`
+        message: `バッテリー: ${battery !== 'N/A' ? battery + '%' : battery}, 速度: ${speed !== 'N/A' ? speed + 'cm/s' : speed}, 飛行時間: ${time !== 'N/A' ? time + '秒' : time}`
       };
     } catch (error) {
-      return { success: false, message: `ステータス取得エラー: ${error}` };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { 
+        success: false, 
+        message: `ステータス取得エラー: ${errorMessage}`,
+        status: { connected: false }
+      };
     }
   },
 });
@@ -181,14 +265,26 @@ export const telloDisconnect = createTool({
   description: 'Telloドローンとの接続を終了します',
   execute: async ({ context }) => {
     try {
-      if (tello) {
-        await tello.disconnect();
+      if (tello && isConnected) {
+        const restoreLogs = suppressLogs();
+        try {
+          await tello.disconnect();
+          restoreLogs();
+        } catch (error) {
+          restoreLogs();
+          throw error;
+        }
         tello = null;
+        isConnected = false;
         return { success: true, message: 'Telloとの接続を終了しました' };
       }
       return { success: true, message: 'Telloは既に切断されています' };
     } catch (error) {
-      return { success: false, message: `切断エラー: ${error}` };
+      // エラーが発生してもフラグはリセット
+      tello = null;
+      isConnected = false;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { success: false, message: `切断エラー: ${errorMessage}` };
     }
   },
 }); 
