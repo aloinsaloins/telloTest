@@ -39,6 +39,7 @@
     "@mastra/loggers": "^0.10.0",
     "@mastra/memory": "^0.10.1",
     "dgram": "^1.0.1",
+    "dotenv": "^16.5.0",
     "tello-drone": "^3.0.6",
     "zod": "^3.25.55"
   },

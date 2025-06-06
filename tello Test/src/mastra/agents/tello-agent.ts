@@ -1,15 +1,16 @@
 import { google } from '@ai-sdk/google';
 import { Agent } from '@mastra/core/agent';
 import {
-  telloConnectTool,
-  telloDisconnectTool,
-  telloTakeoffTool,
-  telloLandTool,
-  telloMoveTool,
-  telloRotateTool,
-  telloStatusTool,
-  telloEmergencyTool,
-} from '../tools/tello-tools';
+  telloConnect,
+  telloDisconnect,
+  telloGetStatus,
+  telloTakeoff,
+  telloLand,
+  telloEmergency,
+  telloMove,
+  telloRotate,
+  telloGetBattery,
+} from '../../../mastra-tello-tools';
 
 export const telloAgent = new Agent({
   name: 'Tello Drone Controller',
@@ -17,22 +18,21 @@ export const telloAgent = new Agent({
 
 主な機能:
 - 自然言語でのドローン制御コマンドの理解と実行
-- 永続的な接続管理（一度接続すると複数のコマンドで再利用可能）
+- HTTP API経由でのTello制御（Webサーバー必須）
 - 安全性を最優先とした操作
 - ユーザーの意図を正確に解釈してドローンを制御
 
 対応可能な操作:
-1. 接続管理（接続・切断・ステータス確認）
-2. 離陸と着陸（自動接続対応）
-3. 移動（上下左右前後）（自動接続対応）
-4. 回転（時計回り・反時計回り）（自動接続対応）
-5. 緊急停止（自動接続対応）
+1. 接続管理（接続・切断・ステータス確認・バッテリー残量）
+2. 離陸と着陸
+3. 移動（上下左右前後）
+4. 回転（時計回り・反時計回り）
+5. 緊急停止
 
-永続接続システム:
-- 初回接続後は接続状態が維持されます
-- 他のコマンド実行時に自動的に接続確認・再接続を行います
-- 明示的に切断するまで接続は保持されます
-- 接続状態はステータス確認で確認できます
+HTTP APIシステム:
+- 事前にPython Webサーバー（tello_web_server.py）の起動が必要
+- localhost:8080でTello制御APIにアクセス
+- RESTful APIでTelloを制御
 
 安全ガイドライン:
 - 離陸前には必ずバッテリー残量を確認
@@ -49,26 +49,33 @@ export const telloAgent = new Agent({
 - 接続状態についても適切に報告
 
 例:
-- "ドローンに接続して" → 永続接続を確立
-- "ドローンを離陸させて" → 自動接続後、バッテリー確認して離陸実行
-- "前に100cm進んで" → 自動接続確認後、前進100cm実行
-- "右に90度回転して" → 自動接続確認後、時計回りに90度回転実行
-- "着陸して" → 自動接続確認後、着陸実行
+- "ドローンに接続して" → HTTP API経由でTelloに接続
+- "ドローンを離陸させて" → バッテリー確認後、離陸実行
+- "前に100cm進んで" → 前進100cm実行
+- "右に90度回転して" → 時計回りに90度回転実行
+- "着陸して" → 着陸実行
 - "ステータスを確認して" → 接続状態とバッテリー残量等の確認
+- "バッテリー残量は？" → バッテリー残量確認
 - "切断して" → ドローンから切断
 
-常に安全を最優先に、効率的な永続接続を活用してユーザーの指示を正確に実行してください。`,
+使用前の準備:
+1. Telloの電源を入れてWiFiに接続
+2. Python Webサーバーを起動: python tello_web_server.py
+3. サーバーが localhost:8080 で起動していることを確認
+
+常に安全を最優先に、HTTP API経由でユーザーの指示を正確に実行してください。`,
 
   model: google('gemini-1.5-pro-latest'),
 
   tools: {
-    telloConnectTool,
-    telloDisconnectTool,
-    telloTakeoffTool,
-    telloLandTool,
-    telloMoveTool,
-    telloRotateTool,
-    telloStatusTool,
-    telloEmergencyTool,
+    telloConnect,
+    telloDisconnect,
+    telloGetStatus,
+    telloTakeoff,
+    telloLand,
+    telloMove,
+    telloRotate,
+    telloEmergency,
+    telloGetBattery,
   },
 }); 
