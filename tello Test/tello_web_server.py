@@ -119,7 +119,7 @@ class AsyncTelloController:
                 "timestamp": datetime.now().isoformat()
             }
     
-    async def _send_command(self, command: str, timeout: int = 5) -> str:
+    async def _send_command(self, command: str, timeout: int = 5, retry_on_timeout: bool = True) -> str:
         """コマンドをTelloに送信し、応答を受信します"""
         try:
             logger.debug(f"送信: {command}")
@@ -144,6 +144,18 @@ class AsyncTelloController:
                     await asyncio.sleep(0.1)
             
             logger.warning("コマンドタイムアウト")
+            
+            # タイムアウト時の自動再接続（commandコマンド以外で実行）
+            if retry_on_timeout and command != 'command':
+                logger.info("タイムアウトのため自動再接続を試行します...")
+                reconnect_result = await self._auto_reconnect()
+                if reconnect_result:
+                    logger.info("再接続成功、コマンドを再実行します")
+                    # 再接続後にコマンドを再実行（再帰呼び出しを防ぐためretry_on_timeout=False）
+                    return await self._send_command(command, timeout, retry_on_timeout=False)
+                else:
+                    logger.error("自動再接続に失敗しました")
+            
             return "timeout"
             
         except Exception as e:
@@ -234,6 +246,36 @@ class AsyncTelloController:
             return False
         
         return True
+    
+    async def _auto_reconnect(self) -> bool:
+        """自動再接続を試行します"""
+        try:
+            logger.info("自動再接続を開始します...")
+            
+            # 現在の接続をクリーンアップ
+            self.is_connected = False
+            if self.socket:
+                try:
+                    self.socket.close()
+                except:
+                    pass
+            
+            # 少し待機
+            await asyncio.sleep(1)
+            
+            # 再接続を試行
+            reconnect_result = await self.connect()
+            
+            if reconnect_result.get('success', False):
+                logger.info("自動再接続に成功しました")
+                return True
+            else:
+                logger.error(f"自動再接続に失敗しました: {reconnect_result.get('message', 'Unknown error')}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"自動再接続中にエラーが発生しました: {e}")
+            return False
     
     async def get_battery(self) -> Dict[str, Any]:
         """バッテリー残量を取得します"""
@@ -351,7 +393,7 @@ class AsyncTelloController:
             return {"success": False, "message": "距離は20-500cmの範囲で指定してください"}
         
         logger.debug(f"{direction} {distance}cm移動中...")
-        response = await self._send_command(f'{direction} {distance}')
+        response = await self._send_command(f'{direction} {distance}', timeout=10)
         
         if 'ok' in response.lower():
             self._log_operation("move", {"direction": direction, "distance": distance, "status": "success"})
@@ -360,13 +402,56 @@ class AsyncTelloController:
                 "message": f"{direction}に{distance}cm移動しました",
                 "timestamp": datetime.now().isoformat()
             }
-        else:
-            self._log_operation("move", {"direction": direction, "distance": distance, "status": "failed", "response": response})
+        elif response == "timeout":
+            self._log_operation("move", {"direction": direction, "distance": distance, "status": "timeout"})
             return {
                 "success": False,
-                "message": f"移動に失敗しました: {response}",
+                "message": f"移動コマンドがタイムアウトしました。自動再接続を試行しました。ドローンの状態を確認してください。",
                 "timestamp": datetime.now().isoformat()
             }
+        else:
+            self._log_operation("move", {"direction": direction, "distance": distance, "status": "failed", "response": response})
+            
+            # Auto landエラーの場合は特別な処理
+            if "auto land" in response.lower():
+                # 飛行状態を着陸に更新
+                self.flight_status = "landed"
+                
+                # バッテリー残量を確認
+                battery_info = await self.get_battery()
+                current_battery = battery_info.get('battery', 0)
+                
+                return {
+                    "success": False,
+                    "message": f"ドローンが自動着陸しました。原因: {response}",
+                    "details": {
+                        "reason": "auto_land",
+                        "battery": current_battery,
+                        "flight_status": self.flight_status,
+                        "recommendations": [
+                            "バッテリー残量を確認してください（推奨: 30%以上）",
+                            "ドローンとの距離が遠すぎないか確認してください",
+                            "周囲に障害物がないか確認してください",
+                            "再度離陸する前に少し待機してください"
+                        ]
+                    },
+                    "raw_response": response,
+                    "timestamp": datetime.now().isoformat()
+                }
+            # Motor stopエラーの場合は特別なメッセージ
+            elif "motor stop" in response.lower():
+                return {
+                    "success": False,
+                    "message": f"移動に失敗しました: モーターが停止しています。ドローンが着陸しているか、障害物を検知した可能性があります。",
+                    "raw_response": response,
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"移動に失敗しました: {response}",
+                    "timestamp": datetime.now().isoformat()
+                }
     
     async def rotate(self, direction: str, degrees: int) -> Dict[str, Any]:
         """回転します"""
@@ -384,7 +469,7 @@ class AsyncTelloController:
             return {"success": False, "message": "角度は1-360度の範囲で指定してください"}
         
         logger.debug(f"{direction} {degrees}度回転中...")
-        response = await self._send_command(f'{direction} {degrees}')
+        response = await self._send_command(f'{direction} {degrees}', timeout=10)
         
         if 'ok' in response.lower():
             self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "success"})
@@ -393,13 +478,48 @@ class AsyncTelloController:
                 "message": f"{direction}方向に{degrees}度回転しました",
                 "timestamp": datetime.now().isoformat()
             }
-        else:
-            self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "failed", "response": response})
+        elif response == "timeout":
+            self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "timeout"})
             return {
                 "success": False,
-                "message": f"回転に失敗しました: {response}",
+                "message": f"回転コマンドがタイムアウトしました。自動再接続を試行しました。ドローンの状態を確認してください。",
                 "timestamp": datetime.now().isoformat()
             }
+        else:
+            self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "failed", "response": response})
+            
+            # Auto landエラーの場合は特別な処理
+            if "auto land" in response.lower():
+                # 飛行状態を着陸に更新
+                self.flight_status = "landed"
+                
+                # バッテリー残量を確認
+                battery_info = await self.get_battery()
+                current_battery = battery_info.get('battery', 0)
+                
+                return {
+                    "success": False,
+                    "message": f"ドローンが自動着陸しました。原因: {response}",
+                    "details": {
+                        "reason": "auto_land",
+                        "battery": current_battery,
+                        "flight_status": self.flight_status,
+                        "recommendations": [
+                            "バッテリー残量を確認してください（推奨: 30%以上）",
+                            "ドローンとの距離が遠すぎないか確認してください",
+                            "周囲に障害物がないか確認してください",
+                            "再度離陸する前に少し待機してください"
+                        ]
+                    },
+                    "raw_response": response,
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"回転に失敗しました: {response}",
+                    "timestamp": datetime.now().isoformat()
+                }
     
     async def get_status(self) -> Dict[str, Any]:
         """ドローンの状態を取得します"""
