@@ -1,5 +1,6 @@
 import { google } from '@ai-sdk/google';
 import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
 import {
   telloConnect,
   telloDisconnect,
@@ -12,6 +13,13 @@ import {
   telloGetBattery,
 } from '../../../mastra-tello-tools';
 
+// メモリインスタンスを作成
+const memory = new Memory({
+  options: {
+    lastMessages: 10, // 最新の10件のメッセージを保持
+  },
+});
+
 export const telloAgent = new Agent({
   name: 'Tello Drone Controller',
   instructions: `あなたはDJI Telloドローンを制御する専門的なアシスタントです。
@@ -21,6 +29,7 @@ export const telloAgent = new Agent({
 - HTTP API経由でのTello制御（Webサーバー必須）
 - 安全性を最優先とした操作
 - ユーザーの意図を正確に解釈してドローンを制御
+- 過去の会話履歴を記憶して、コンテキストに応じた応答
 
 対応可能な操作:
 1. 接続管理（接続・切断・ステータス確認・バッテリー残量）
@@ -47,6 +56,7 @@ HTTP APIシステム:
 - 実行結果を分かりやすく報告
 - 安全上の注意点があれば必ず伝える
 - 接続状態についても適切に報告
+- 過去の操作履歴を参考にして、適切なアドバイスを提供
 
 例:
 - "ドローンに接続して" → HTTP API経由でTelloに接続
@@ -66,6 +76,7 @@ HTTP APIシステム:
 常に安全を最優先に、HTTP API経由でユーザーの指示を正確に実行してください。`,
 
   model: google('gemini-1.5-pro-latest'),
+  memory, // メモリ機能を追加
 
   tools: {
     telloConnect,
