@@ -79,7 +79,7 @@ class AsyncTelloController:
                 logger.info(f"Tello接続試行 {attempt + 1}/3")
                 response = await self._send_command('command', timeout=10)
                 
-                if response and 'ok' in response.lower():
+                                if response and 'ok' in response.lower():
                     self.is_connected = True
                     logger.info("Telloに正常に接続されました")
                     
@@ -314,50 +314,44 @@ class AsyncTelloController:
     
     async def emergency(self) -> Dict[str, Any]:
         """緊急停止します"""
-        logger.debug("緊急停止!")
+        logger.warning("緊急停止!")
         response = await self._send_command('emergency')
         
-        if 'ok' in response.lower():
-            self.flight_status = "emergency"
-            self._log_operation("emergency", {"status": "success"})
-            return {
-                "success": True,
-                "message": "緊急停止を実行しました",
-                "flight_status": self.flight_status,
-                "timestamp": datetime.now().isoformat()
-            }
-        else:
-            self._log_operation("emergency", {"status": "failed", "response": response})
-            return {
-                "success": False,
-                "message": f"緊急停止に失敗しました: {response}",
-                "timestamp": datetime.now().isoformat()
-            }
+        self.flight_status = "emergency"
+        self._log_operation("emergency", {"status": "executed", "response": response})
+        
+        return {
+            "success": True,
+            "message": "緊急停止を実行しました",
+            "flight_status": self.flight_status,
+            "timestamp": datetime.now().isoformat()
+        }
     
     async def move(self, direction: str, distance: int) -> Dict[str, Any]:
-        """移動します"""
+        """指定方向に移動します"""
         if not self.is_connected:
             return {"success": False, "message": "Telloに接続されていません"}
         
         if self.flight_status != "flying":
             return {"success": False, "message": "飛行中ではありません"}
         
-        # 方向と距離の検証
-        valid_directions = ['up', 'down', 'left', 'right', 'forward', 'back']
-        if direction not in valid_directions:
-            return {"success": False, "message": f"無効な方向です: {direction}"}
-        
         if not (20 <= distance <= 500):
             return {"success": False, "message": "距離は20-500cmの範囲で指定してください"}
         
-        logger.debug(f"{direction} {distance}cm移動中...")
-        response = await self._send_command(f'{direction} {distance}')
+        valid_directions = ['up', 'down', 'left', 'right', 'forward', 'back']
+        if direction not in valid_directions:
+            return {"success": False, "message": f"無効な方向です。有効な方向: {valid_directions}"}
+        
+        logger.debug(f"{direction}に{distance}cm移動中...")
+        response = await self._send_command(f'{direction} {distance}', timeout=10)
         
         if 'ok' in response.lower():
             self._log_operation("move", {"direction": direction, "distance": distance, "status": "success"})
             return {
                 "success": True,
                 "message": f"{direction}に{distance}cm移動しました",
+                "direction": direction,
+                "distance": distance,
                 "timestamp": datetime.now().isoformat()
             }
         else:
@@ -376,21 +370,22 @@ class AsyncTelloController:
         if self.flight_status != "flying":
             return {"success": False, "message": "飛行中ではありません"}
         
-        # 回転方向と角度の検証
-        if direction not in ['cw', 'ccw']:
-            return {"success": False, "message": f"無効な回転方向です: {direction}"}
-        
         if not (1 <= degrees <= 360):
             return {"success": False, "message": "角度は1-360度の範囲で指定してください"}
         
-        logger.debug(f"{direction} {degrees}度回転中...")
-        response = await self._send_command(f'{direction} {degrees}')
+        if direction not in ['cw', 'ccw']:
+            return {"success": False, "message": "回転方向はcw（時計回り）またはccw（反時計回り）で指定してください"}
+        
+        logger.debug(f"{direction}に{degrees}度回転中...")
+        response = await self._send_command(f'{direction} {degrees}', timeout=10)
         
         if 'ok' in response.lower():
             self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "success"})
             return {
                 "success": True,
-                "message": f"{direction}方向に{degrees}度回転しました",
+                "message": f"{direction}に{degrees}度回転しました",
+                "direction": direction,
+                "degrees": degrees,
                 "timestamp": datetime.now().isoformat()
             }
         else:
@@ -402,21 +397,23 @@ class AsyncTelloController:
             }
     
     async def get_status(self) -> Dict[str, Any]:
-        """ドローンの状態を取得します"""
+        """現在の状態を取得します"""
+        battery_info = await self.get_battery() if self.is_connected else {"battery": 0}
+        
         return {
-            "success": True,
             "connected": self.is_connected,
             "flight_status": self.flight_status,
-            "battery": self.last_battery,
+            "battery": battery_info.get("battery", 0),
+            "last_operations": self.operation_log[-5:],  # 最新5件の操作ログ
             "timestamp": datetime.now().isoformat()
         }
     
     def _log_operation(self, operation: str, details: Dict[str, Any]):
         """操作ログを記録します"""
         log_entry = {
-            "timestamp": datetime.now().isoformat(),
             "operation": operation,
-            "details": details
+            "details": details,
+            "timestamp": datetime.now().isoformat()
         }
         self.operation_log.append(log_entry)
         
@@ -561,18 +558,7 @@ async def cors_handler(request: web.Request) -> web.Response:
 
 def setup_cors(app):
     """CORS設定"""
-    @web.middleware
     async def cors_middleware(request, handler):
-        # OPTIONSリクエストの場合は直接レスポンスを返す
-        if request.method == 'OPTIONS':
-            return web.Response(
-                headers={
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
-                }
-            )
-        
         try:
             response = await handler(request)
             response.headers['Access-Control-Allow-Origin'] = '*'
@@ -601,9 +587,6 @@ def create_app() -> web.Application:
     app.router.add_post('/move', move_handler)
     app.router.add_post('/rotate', rotate_handler)
     
-    # OPTIONS用のルート設定
-    app.router.add_options('/{path:.*}', cors_handler)
-    
     return app
 
 async def main():
@@ -629,7 +612,7 @@ async def main():
         # サーバーを無限に実行
         await asyncio.Future()  # run forever
     except KeyboardInterrupt:
-        logger.info("サーバーを停止中...")
+        logger.info("🛑 サーバーを停止中...")
     finally:
         await tello_controller.disconnect()
         await runner.cleanup()
