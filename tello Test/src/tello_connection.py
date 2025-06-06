@@ -28,7 +28,6 @@ class TelloController:
         
         # ソケット初期化
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((self.local_ip, self.local_port))
         
         # 応答キュー
@@ -53,32 +52,20 @@ class TelloController:
             # 応答受信スレッド開始
             self.receive_thread.start()
             
-            # 少し待機してスレッドが開始されるのを確認
-            time.sleep(0.5)
-            
-            # SDKモードを有効化（複数回試行）
-            for attempt in range(3):
-                print(f"接続試行 {attempt + 1}/3")
-                response = self.send_command('command', timeout=10)
+            # SDKモードを有効化
+            response = self.send_command('command')
+            if 'ok' in response.lower():
+                self.is_connected = True
+                print("Telloに正常に接続されました")
                 
-                if 'ok' in response.lower():
-                    self.is_connected = True
-                    print("Telloに正常に接続されました")
-                    
-                    # バッテリー残量を確認
-                    battery = self.get_battery()
-                    print(f"バッテリー残量: {battery}%")
-                    
-                    return True
-                elif response == "timeout":
-                    print(f"接続タイムアウト (試行 {attempt + 1})")
-                    time.sleep(1)  # 1秒待機してから再試行
-                else:
-                    print(f"予期しない応答: {response}")
-                    time.sleep(1)
-            
-            print("Tello接続に失敗しました")
-            return False
+                # バッテリー残量を確認
+                battery = self.get_battery()
+                print(f"バッテリー残量: {battery}%")
+                
+                return True
+            else:
+                print("Tello接続に失敗しました")
+                return False
                 
         except Exception as e:
             print(f"接続エラー: {e}")
@@ -118,24 +105,7 @@ class TelloController:
             try:
                 self.socket.settimeout(1.0)  # 1秒のタイムアウトを設定
                 response, _ = self.socket.recvfrom(1024)
-                
-                # 複数のエンコーディングを試行
-                response_str = None
-                for encoding in ['utf-8', 'ascii', 'latin-1']:
-                    try:
-                        response_str = response.decode(encoding).strip()
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                
-                # すべてのエンコーディングが失敗した場合
-                if response_str is None:
-                    # バイナリデータとして処理し、印刷可能文字のみ抽出
-                    response_str = ''.join(chr(b) for b in response if 32 <= b <= 126)
-                    if not response_str:
-                        # 完全にバイナリの場合はスキップ
-                        continue
-                
+                response_str = response.decode('utf-8').strip()
                 print(f"受信: {response_str}")
                 
                 # 応答をキューに追加
