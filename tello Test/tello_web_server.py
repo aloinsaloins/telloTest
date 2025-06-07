@@ -3,6 +3,13 @@
 """
 DJI Tello ドローン Web制御サーバー
 Mastra AIエージェントからHTTP APIでTelloを制御するためのサーバー
+
+主な機能:
+- HTTP API経由でのTello制御
+- 非同期処理対応
+- コマンド競合対策（asyncio.Lock使用）
+- 自動再接続機能
+- バイナリデータフィルタリング
 """
 
 import asyncio
@@ -43,6 +50,9 @@ class AsyncTelloController:
         self.response_queue = queue.Queue()
         self.receive_thread = None
         self.running = False
+        
+        # コマンド実行の直列化用ロック
+        self.command_lock = asyncio.Lock()
         
         # ビデオキャプチャ
         self.cap: Optional[cv2.VideoCapture] = None
@@ -120,47 +130,44 @@ class AsyncTelloController:
             }
     
     async def _send_command(self, command: str, timeout: int = 5, retry_on_timeout: bool = True) -> str:
-        """コマンドをTelloに送信し、応答を受信します"""
-        try:
-            logger.debug(f"送信: {command}")
-            
-            # キューをクリア
-            while not self.response_queue.empty():
-                try:
-                    self.response_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            # コマンド送信
-            self.socket.sendto(command.encode('utf-8'), (self.tello_ip, self.tello_port))
-            
-            # 応答を待機（非同期）
-            for _ in range(timeout * 10):  # 0.1秒間隔でチェック
-                try:
-                    response = self.response_queue.get_nowait()
-                    logger.debug(f"応答: {response}")
-                    return response
-                except queue.Empty:
-                    await asyncio.sleep(0.1)
-            
-            logger.warning("コマンドタイムアウト")
-            
-            # タイムアウト時の自動再接続（commandコマンド以外で実行）
-            if retry_on_timeout and command != 'command':
-                logger.info("タイムアウトのため自動再接続を試行します...")
-                reconnect_result = await self._auto_reconnect()
-                if reconnect_result:
-                    logger.info("再接続成功、コマンドを再実行します")
-                    # 再接続後にコマンドを再実行（再帰呼び出しを防ぐためretry_on_timeout=False）
-                    return await self._send_command(command, timeout, retry_on_timeout=False)
-                else:
-                    logger.error("自動再接続に失敗しました")
-            
-            return "timeout"
-            
-        except Exception as e:
-            logger.error(f"コマンド送信エラー: {e}")
-            return "error"
+        """コマンドをTelloに送信し、応答を受信します（直列化対応）"""
+        async with self.command_lock:  # コマンド実行を直列化
+            try:
+                logger.debug(f"送信: {command}")
+                
+                # キューをクリア
+                while not self.response_queue.empty():
+                    try:
+                        self.response_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                
+                # コマンド送信
+                self.socket.sendto(command.encode('utf-8'), (self.tello_ip, self.tello_port))
+                
+                # 応答を待機（非同期）
+                for _ in range(timeout * 10):  # 0.1秒間隔でチェック
+                    try:
+                        response = self.response_queue.get_nowait()
+                        logger.debug(f"応答: {response}")
+                        return response
+                    except queue.Empty:
+                        await asyncio.sleep(0.1)
+                
+                logger.warning(f"コマンドタイムアウト: {command}")
+                
+                # タイムアウト時の自動再接続（commandコマンド以外で実行）
+                if retry_on_timeout and command != 'command':
+                    logger.info("タイムアウトのため自動再接続を試行します...")
+                    # 再接続は別のロック取得が必要なので、ここではretry_on_timeout=Falseで再実行
+                    # 実際の再接続は呼び出し元で処理
+                    return "timeout"
+                
+                return "timeout"
+                
+            except Exception as e:
+                logger.error(f"コマンド送信エラー: {e}")
+                return "error"
     
     def _receive_response(self):
         """応答を継続的に受信するスレッド"""
@@ -248,7 +255,7 @@ class AsyncTelloController:
         return True
     
     async def _auto_reconnect(self) -> bool:
-        """自動再接続を試行します"""
+        """自動再接続を試行します（ロック競合回避版）"""
         try:
             logger.info("自動再接続を開始します...")
             
@@ -263,14 +270,42 @@ class AsyncTelloController:
             # 少し待機
             await asyncio.sleep(1)
             
-            # 再接続を試行
-            reconnect_result = await self.connect()
-            
-            if reconnect_result.get('success', False):
-                logger.info("自動再接続に成功しました")
-                return True
-            else:
-                logger.error(f"自動再接続に失敗しました: {reconnect_result.get('message', 'Unknown error')}")
+            # ソケット再初期化
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.socket.bind((self.local_ip, self.local_port))
+                
+                # 応答受信スレッドが停止していれば再開
+                if not self.receive_thread or not self.receive_thread.is_alive():
+                    self.running = True
+                    self.receive_thread = threading.Thread(target=self._receive_response)
+                    self.receive_thread.daemon = True
+                    self.receive_thread.start()
+                    await asyncio.sleep(0.5)
+                
+                # SDKモードを有効化（1回のみ試行）
+                logger.info("SDK再接続を試行中...")
+                response = await self._send_command('command', timeout=10, retry_on_timeout=False)
+                
+                if response and 'ok' in response.lower():
+                    self.is_connected = True
+                    logger.info("自動再接続に成功しました")
+                    
+                    # バッテリー残量を確認
+                    try:
+                        battery_response = await self._send_command('battery?', timeout=5, retry_on_timeout=False)
+                        self.last_battery = int(battery_response) if battery_response.isdigit() else 0
+                    except:
+                        self.last_battery = 0
+                    
+                    return True
+                else:
+                    logger.error(f"SDK再接続に失敗: {response}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"ソケット再初期化エラー: {e}")
                 return False
                 
         except Exception as e:
@@ -404,11 +439,38 @@ class AsyncTelloController:
             }
         elif response == "timeout":
             self._log_operation("move", {"direction": direction, "distance": distance, "status": "timeout"})
-            return {
-                "success": False,
-                "message": f"移動コマンドがタイムアウトしました。自動再接続を試行しました。ドローンの状態を確認してください。",
-                "timestamp": datetime.now().isoformat()
-            }
+            
+            # 自動再接続を試行
+            logger.info("移動コマンドタイムアウト、自動再接続を試行します...")
+            reconnect_success = await self._auto_reconnect()
+            
+            if reconnect_success:
+                logger.info("再接続成功、移動コマンドを再実行します")
+                # 再接続後にコマンドを再実行
+                retry_response = await self._send_command(f'{direction} {distance}', timeout=10, retry_on_timeout=False)
+                
+                if 'ok' in retry_response.lower():
+                    self._log_operation("move", {"direction": direction, "distance": distance, "status": "success_after_reconnect"})
+                    return {
+                        "success": True,
+                        "message": f"再接続後に{direction}に{distance}cm移動しました",
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": f"再接続後も移動に失敗しました: {retry_response}",
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            else:
+                return {
+                    "success": False,
+                    "message": "移動コマンドがタイムアウトし、自動再接続にも失敗しました。ドローンの状態を確認してください。",
+                    "reconnected": False,
+                    "timestamp": datetime.now().isoformat()
+                }
         else:
             self._log_operation("move", {"direction": direction, "distance": distance, "status": "failed", "response": response})
             
@@ -480,11 +542,38 @@ class AsyncTelloController:
             }
         elif response == "timeout":
             self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "timeout"})
-            return {
-                "success": False,
-                "message": f"回転コマンドがタイムアウトしました。自動再接続を試行しました。ドローンの状態を確認してください。",
-                "timestamp": datetime.now().isoformat()
-            }
+            
+            # 自動再接続を試行
+            logger.info("回転コマンドタイムアウト、自動再接続を試行します...")
+            reconnect_success = await self._auto_reconnect()
+            
+            if reconnect_success:
+                logger.info("再接続成功、回転コマンドを再実行します")
+                # 再接続後にコマンドを再実行
+                retry_response = await self._send_command(f'{direction} {degrees}', timeout=10, retry_on_timeout=False)
+                
+                if 'ok' in retry_response.lower():
+                    self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "success_after_reconnect"})
+                    return {
+                        "success": True,
+                        "message": f"再接続後に{direction}方向に{degrees}度回転しました",
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": f"再接続後も回転に失敗しました: {retry_response}",
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            else:
+                return {
+                    "success": False,
+                    "message": "回転コマンドがタイムアウトし、自動再接続にも失敗しました。ドローンの状態を確認してください。",
+                    "reconnected": False,
+                    "timestamp": datetime.now().isoformat()
+                }
         else:
             self._log_operation("rotate", {"direction": direction, "degrees": degrees, "status": "failed", "response": response})
             
@@ -611,8 +700,46 @@ async def emergency_handler(request: web.Request) -> web.Response:
 async def move_handler(request: web.Request) -> web.Response:
     """移動エンドポイント"""
     try:
-        direction = request.query.get('direction')
-        distance = int(request.query.get('distance', 0))
+        # デバッグ情報をログ出力
+        logger.info(f"Content-Type: {request.content_type}")
+        logger.info(f"Headers: {dict(request.headers)}")
+        
+        # JSONボディまたはクエリパラメータから取得
+        # まずボディの内容を確認
+        body_text = await request.text()
+        logger.info(f"Request body: '{body_text}'")
+        
+        if body_text.strip() and (request.content_type == 'application/json' or body_text.strip().startswith('{')):
+            # JSONボディから取得
+            try:
+                data = json.loads(body_text)
+                direction = data.get('direction')
+                distance = data.get('distance', 0)
+                logger.info(f"JSON解析成功: direction={direction}, distance={distance}")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析エラー: {e}")
+                return web.json_response(
+                    {"success": False, "message": f"無効なJSON形式です: {str(e)}"}, 
+                    status=400
+                )
+        else:
+            # クエリパラメータから取得
+            direction = request.query.get('direction')
+            distance = request.query.get('distance')
+            logger.info(f"クエリパラメータ使用: direction={direction}, distance={distance}")
+            
+            # パラメータが不足している場合のエラーハンドリング
+            if not direction or distance is None:
+                return web.json_response(
+                    {"success": False, "message": "JSONボディが空で、必要なパラメータ（direction, distance）が不足しています。JSONボディまたはクエリパラメータで送信してください。"}, 
+                    status=400
+                )
+        
+        # distanceを数値に変換
+        if isinstance(distance, str):
+            distance = int(distance)
+        elif not isinstance(distance, (int, float)):
+            raise ValueError("distanceは数値で指定してください")
         
         if not direction:
             return web.json_response(
@@ -620,12 +747,12 @@ async def move_handler(request: web.Request) -> web.Response:
                 status=400
             )
         
-        result = await tello_controller.move(direction, distance)
+        result = await tello_controller.move(direction, int(distance))
         return web.json_response(result)
         
-    except ValueError:
+    except ValueError as e:
         return web.json_response(
-            {"success": False, "message": "distanceは数値で指定してください"}, 
+            {"success": False, "message": f"distanceは数値で指定してください: {str(e)}"}, 
             status=400
         )
     except Exception as e:
@@ -637,8 +764,46 @@ async def move_handler(request: web.Request) -> web.Response:
 async def rotate_handler(request: web.Request) -> web.Response:
     """回転エンドポイント"""
     try:
-        direction = request.query.get('direction')
-        degrees = int(request.query.get('degrees', 0))
+        # デバッグ情報をログ出力
+        logger.info(f"Content-Type: {request.content_type}")
+        logger.info(f"Headers: {dict(request.headers)}")
+        
+        # JSONボディまたはクエリパラメータから取得
+        # まずボディの内容を確認
+        body_text = await request.text()
+        logger.info(f"Request body: '{body_text}'")
+        
+        if body_text.strip() and (request.content_type == 'application/json' or body_text.strip().startswith('{')):
+            # JSONボディから取得
+            try:
+                data = json.loads(body_text)
+                direction = data.get('direction')
+                degrees = data.get('degrees', 0)
+                logger.info(f"JSON解析成功: direction={direction}, degrees={degrees}")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析エラー: {e}")
+                return web.json_response(
+                    {"success": False, "message": f"無効なJSON形式です: {str(e)}"}, 
+                    status=400
+                )
+        else:
+            # クエリパラメータから取得
+            direction = request.query.get('direction')
+            degrees = request.query.get('degrees')
+            logger.info(f"クエリパラメータ使用: direction={direction}, degrees={degrees}")
+            
+            # パラメータが不足している場合のエラーハンドリング
+            if not direction or degrees is None:
+                return web.json_response(
+                    {"success": False, "message": "JSONボディが空で、必要なパラメータ（direction, degrees）が不足しています。JSONボディまたはクエリパラメータで送信してください。"}, 
+                    status=400
+                )
+        
+        # degreesを数値に変換
+        if isinstance(degrees, str):
+            degrees = int(degrees)
+        elif not isinstance(degrees, (int, float)):
+            raise ValueError("degreesは数値で指定してください")
         
         if not direction:
             return web.json_response(
@@ -646,12 +811,12 @@ async def rotate_handler(request: web.Request) -> web.Response:
                 status=400
             )
         
-        result = await tello_controller.rotate(direction, degrees)
+        result = await tello_controller.rotate(direction, int(degrees))
         return web.json_response(result)
         
-    except ValueError:
+    except ValueError as e:
         return web.json_response(
-            {"success": False, "message": "degreesは数値で指定してください"}, 
+            {"success": False, "message": f"degreesは数値で指定してください: {str(e)}"}, 
             status=400
         )
     except Exception as e:

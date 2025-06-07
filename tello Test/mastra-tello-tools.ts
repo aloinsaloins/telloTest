@@ -238,17 +238,19 @@ export const telloMove = new Tool({
     direction: z.enum(['up', 'down', 'left', 'right', 'forward', 'back']).describe('移動方向（up: 上昇, down: 下降, left: 左, right: 右, forward: 前進, back: 後退）'),
     distance: z.number().min(20).max(500).describe('移動距離（センチメートル、20-500の範囲）'),
   }),
-  execute: async ({ direction, distance }) => {
+  execute: async ({ context }) => {
     try {
-      const response = await fetch(
-        `${TELLO_API_BASE_URL}/move?direction=${direction}&distance=${distance}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }
-      );
+      const { direction, distance } = context;
+      const response = await fetch(`${TELLO_API_BASE_URL}/move`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          direction,
+          distance,
+        }),
+      });
       // …
       const result = await response.json();
       
@@ -288,11 +290,15 @@ export const telloRotate = new Tool({
   execute: async ({ context }) => {
     try {
       const { direction, degrees } = context;
-      const response = await fetch(`${TELLO_API_BASE_URL}/rotate?direction=${direction}&degrees=${degrees}`, {
+      const response = await fetch(`${TELLO_API_BASE_URL}/rotate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({
+          direction,
+          degrees,
+        }),
       });
       
       const result = await response.json();
