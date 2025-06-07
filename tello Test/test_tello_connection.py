@@ -83,7 +83,7 @@ def test_connection_monitoring():
     while time.time() - start_time < 10:
         remaining = 10 - int(time.time() - start_time)
         print(f"残り {remaining}秒... ", end="\r")
-        time.sleep(1)
+        await asyncio.sleep(1)
     
     print("\nOK 監視テスト完了")
     print("INFO WARNINGレベルのメッセージが大幅に減っているはずです")
