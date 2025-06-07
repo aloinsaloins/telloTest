@@ -1,134 +1,17 @@
 import { Agent } from '@mastra/core/agent';
-import { createTool } from '@mastra/core/tools';
 import { google } from '@ai-sdk/google';
-import { z } from 'zod';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
-
-// Telloツールを作成
-const connectTello = createTool({
-  id: 'connect_tello',
-  description: 'Telloドローンに接続します',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/connect', { method: 'POST' });
-    return await response.json();
-  }
-});
-
-const disconnectTello = createTool({
-  id: 'disconnect_tello',
-  description: 'Telloドローンから切断します',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/disconnect', { method: 'POST' });
-    return await response.json();
-  }
-});
-
-const getTelloStatus = createTool({
-  id: 'get_tello_status',
-  description: 'Telloドローンの状態を取得します',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/status');
-    return await response.json();
-  }
-});
-
-const getBattery = createTool({
-  id: 'get_battery',
-  description: 'Telloドローンのバッテリー残量を取得します',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/battery');
-    return await response.json();
-  }
-});
-
-const takeoff = createTool({
-  id: 'takeoff',
-  description: 'Telloドローンを離陸させます',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/takeoff', { method: 'POST' });
-    return await response.json();
-  }
-});
-
-const land = createTool({
-  id: 'land',
-  description: 'Telloドローンを着陸させます',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/land', { method: 'POST' });
-    return await response.json();
-  }
-});
-
-const emergencyStop = createTool({
-  id: 'emergency_stop',
-  description: 'Telloドローンを緊急停止させます',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/emergency', { method: 'POST' });
-    return await response.json();
-  }
-});
-
-const moveDrone = createTool({
-  id: 'move_drone',
-  description: 'Telloドローンを指定した方向に移動させます',
-  inputSchema: z.object({
-    direction: z.enum(['up', 'down', 'left', 'right', 'forward', 'back']),
-    distance: z.number().min(20).max(500)
-  }),
-  execute: async ({ context }) => {
-    const response = await fetch('/api/move', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ direction: context.direction, distance: context.distance })
-    });
-    return await response.json();
-  }
-});
-
-const rotateDrone = createTool({
-  id: 'rotate_drone',
-  description: 'Telloドローンを指定した方向に回転させます',
-  inputSchema: z.object({
-    direction: z.enum(['cw', 'ccw']),
-    degrees: z.number().min(1).max(360)
-  }),
-  execute: async ({ context }) => {
-    const response = await fetch('/api/rotate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ direction: context.direction, degrees: context.degrees })
-    });
-    return await response.json();
-  }
-});
-
-const startVideoStream = createTool({
-  id: 'start_video_stream',
-  description: 'Telloドローンのビデオストリーミングを開始します',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/video/start', { method: 'POST' });
-    return await response.json();
-  }
-});
-
-const stopVideoStream = createTool({
-  id: 'stop_video_stream',
-  description: 'Telloドローンのビデオストリーミングを停止します',
-  inputSchema: z.object({}),
-  execute: async () => {
-    const response = await fetch('/api/video/stop', { method: 'POST' });
-    return await response.json();
-  }
-});
+import { 
+  telloConnectTool,
+  telloDisconnectTool,
+  telloTakeoffTool,
+  telloLandTool,
+  telloMoveTool,
+  telloRotateTool,
+  telloStatusTool,
+  telloEmergencyTool
+} from '../tools/tello-tools';
 
 export const telloAgent = new Agent({
   name: 'TelloAgent',
@@ -144,6 +27,50 @@ export const telloAgent = new Agent({
 - ビデオストリーミング制御
 - 緊急停止
 
+重要な動作指示:
+1. **複数のコマンドを含む指示の処理**:
+   - ユーザーが複数の動作を一度に指示した場合、必ず全ての動作を順次実行してください
+   - 各動作を個別のツール呼び出しとして実行し、前の動作が完了してから次の動作を実行してください
+   
+   具体例:
+   - 「離陸して、20cm右に動いて」→ 
+     1. tello_takeoff を実行
+     2. tello_move(direction: "right", distance: 20) を実行
+   
+   - 「離陸して、前に50cm進んで、時計回りに90度回転して、着陸して」→
+     1. tello_takeoff を実行
+     2. tello_move(direction: "forward", distance: 50) を実行
+     3. tello_rotate(direction: "clockwise", degrees: 90) を実行
+     4. tello_land を実行
+
+2. **動作の順序**:
+   - 離陸が必要な場合は、他の動作の前に必ず離陸を実行してください
+   - 移動や回転は離陸後にのみ実行してください
+   - 着陸が指示された場合は、最後に実行してください
+
+3. **距離と方向の解釈**:
+   - 日本語の方向指示を英語に正確に変換してください:
+     * 右 → "right"
+     * 左 → "left" 
+     * 前/前方 → "forward"
+     * 後ろ/後方 → "back"
+     * 上 → "up"
+     * 下 → "down"
+   - 距離はcm単位で指定し、20-500cmの範囲内で調整してください
+   - 回転方向の変換:
+     * 時計回り/右回り → "clockwise"
+     * 反時計回り/左回り → "counter_clockwise"
+
+4. **実行フロー**:
+   - 各ツールを呼び出す前に、実行する動作をユーザーに説明してください
+   - 各ツールの実行結果を確認し、成功/失敗を報告してください
+   - エラーが発生した場合は、詳細を説明し、次の動作を継続するか判断してください
+
+5. **安全確認**:
+   - 離陸前にバッテリー残量を確認してください（tello_status使用）
+   - バッテリーが30%未満の場合は警告を出してください
+   - 移動距離が大きい場合は注意を促してください
+
 安全に関する重要な注意事項:
 1. 離陸前に必ずバッテリー残量を確認してください（推奨: 30%以上）
 2. 屋内での飛行時は障害物に注意してください
@@ -158,22 +85,23 @@ export const telloAgent = new Agent({
 - ユーザーの操作パターン
 - 安全に関する注意事項の確認状況
 
+**最重要**: 
+- 複数の動作が含まれる指示を受けた場合は、必ず全ての動作を順次実行してください
+- 一つの動作だけで終了せず、指示された全ての動作を完了してください
+- 各動作の実行前後でユーザーに状況を報告してください
+
 ユーザーの指示に従って、安全にドローンを制御してください。
-過去の操作履歴を参考にして、より良いサポートを提供します。
 `,
   model: google('gemini-1.5-flash'),
   tools: {
-    connectTello,
-    disconnectTello,
-    getTelloStatus,
-    getBattery,
-    takeoff,
-    land,
-    emergencyStop,
-    moveDrone,
-    rotateDrone,
-    startVideoStream,
-    stopVideoStream
+    tello_connect: telloConnectTool,
+    tello_disconnect: telloDisconnectTool,
+    tello_status: telloStatusTool,
+    tello_takeoff: telloTakeoffTool,
+    tello_land: telloLandTool,
+    tello_move: telloMoveTool,
+    tello_rotate: telloRotateTool,
+    tello_emergency: telloEmergencyTool
   },
   memory: new Memory({
     storage: new LibSQLStore({

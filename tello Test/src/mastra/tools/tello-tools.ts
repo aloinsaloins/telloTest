@@ -1,56 +1,77 @@
 import { createTool } from "@mastra/core";
 import { z } from "zod";
-import { spawn } from "child_process";
 
 // 永続的なTello接続マネージャーを実行するヘルパー関数
 async function executeTelloManager(action: string, options: { command?: string; distance?: number; degrees?: number } = {}): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const args = ['src/tello_connection_manager.py', action];
-    
-    if (options.command) {
-      args.push('--command', options.command);
-    }
-    
-    if (options.distance !== undefined) {
-      args.push('--distance', options.distance.toString());
-    }
-    
-    if (options.degrees !== undefined) {
-      args.push('--degrees', options.degrees.toString());
-    }
+  try {
+    let url = '';
+    let method = 'GET';
+    let body: any = null;
 
-    const pythonProcess = spawn('python', args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
-    });
-
-    let output = '';
-    let error = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      error += data.toString();
-    });
-
-    pythonProcess.on('close', (code) => {
-      if (code === 0) {
-        try {
-          // 出力の最後の行（JSON部分）のみを取得
-          const lines = output.trim().split('\n');
-          const jsonLine = lines[lines.length - 1];
-          const result = JSON.parse(jsonLine);
-          resolve(result);
-        } catch (parseError) {
-          reject(new Error(`JSON parse error: ${output}`));
+    // アクションに応じてAPIエンドポイントを決定
+    switch (action) {
+      case 'connect':
+        url = 'http://localhost:8080/api/connect';
+        method = 'POST';
+        break;
+      case 'disconnect':
+        url = 'http://localhost:8080/api/disconnect';
+        method = 'POST';
+        break;
+      case 'status':
+        url = 'http://localhost:8080/api/status';
+        method = 'GET';
+        break;
+      case 'execute':
+        if (options.command === 'takeoff') {
+          url = 'http://localhost:8080/api/takeoff';
+          method = 'POST';
+        } else if (options.command === 'land') {
+          url = 'http://localhost:8080/api/land';
+          method = 'POST';
+        } else if (options.command === 'emergency') {
+          url = 'http://localhost:8080/api/emergency';
+          method = 'POST';
+        } else if (['up', 'down', 'left', 'right', 'forward', 'back'].includes(options.command || '')) {
+          url = 'http://localhost:8080/api/move';
+          method = 'POST';
+          body = {
+            direction: options.command,
+            distance: options.distance
+          };
+        } else if (['cw', 'ccw'].includes(options.command || '')) {
+          url = 'http://localhost:8080/api/rotate';
+          method = 'POST';
+          body = {
+            direction: options.command,
+            degrees: options.degrees
+          };
         }
-      } else {
-        reject(new Error(`Python Manager failed: ${error}`));
-      }
+        break;
+      default:
+        throw new Error(`Unknown action: ${action}`);
+    }
+
+    // HTTPリクエストを送信
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: body ? JSON.stringify(body) : undefined,
     });
-  });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    return result;
+
+  } catch (error) {
+    console.error('executeTelloManager error:', error);
+    throw error;
+  }
 }
 
 // Tello接続ツール（永続接続対応）
