@@ -93,9 +93,17 @@ class AsyncTelloController:
                     self.is_connected = True
                     logger.info("Telloに正常に接続されました")
                     
-                    # バッテリー残量を確認
-                    battery_info = await self.get_battery()
-                    self.last_battery = battery_info.get('battery', 0)
+                    # バッテリー残量を確認（接続フラグ設定後に実行）
+                    try:
+                        battery_response = await self._send_command('battery?', timeout=5)
+                        if battery_response.isdigit():
+                            self.last_battery = int(battery_response)
+                        else:
+                            self.last_battery = 0
+                            logger.warning(f"バッテリー情報の取得に失敗: {battery_response}")
+                    except Exception as e:
+                        logger.warning(f"バッテリー情報取得エラー: {e}")
+                        self.last_battery = 0
                     
                     self._log_operation("connect", {"status": "success", "battery": self.last_battery})
                     
