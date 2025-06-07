@@ -24,6 +24,8 @@ from datetime import datetime
 import contextlib
 import base64
 import time
+import subprocess
+import numpy as np
 
 # ログ設定 - INFOレベル以上を出力（重要な情報のみ）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -62,6 +64,10 @@ class AsyncTelloController:
         self.video_streaming = False
         self.latest_frame = None
         self.frame_lock = threading.Lock()
+        
+        # FFmpegプロセス（代替ビデオ処理用）
+        self.ffmpeg_process = None
+        self.use_ffmpeg = False
         
         # 接続状態
         self.is_connected = False
@@ -666,16 +672,15 @@ class AsyncTelloController:
             response = await self._send_command('streamon')
             
             if 'ok' in response.lower():
-                # OpenCVでビデオキャプチャを開始
-                self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
+                # まずOpenCVを試行
+                success = await self._start_opencv_capture()
                 
-                if self.cap.isOpened():
-                    self.video_streaming = True
-                    # ビデオフレーム取得スレッドを開始
-                    video_thread = threading.Thread(target=self._capture_video_frames)
-                    video_thread.daemon = True
-                    video_thread.start()
-                    
+                if not success:
+                    # OpenCVが失敗した場合、FFmpegを試行
+                    logger.info("OpenCVでの初期化に失敗、FFmpegを試行します...")
+                    success = await self._start_ffmpeg_capture()
+                
+                if success:
                     logger.info("ビデオストリーミングを開始しました")
                     return {
                         "success": True,
@@ -700,14 +705,143 @@ class AsyncTelloController:
                 "message": f"ビデオストリーミング開始エラー: {e}"
             }
     
+    async def _start_opencv_capture(self) -> bool:
+        """OpenCVを使用してビデオキャプチャを開始"""
+        try:
+            # OpenCVでビデオキャプチャを開始（改善されたパラメータ）
+            self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
+            
+            # OpenCVの設定を最適化
+            if self.cap.isOpened():
+                # バッファサイズを小さくしてレイテンシを削減
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # フレームレートを設定
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                # フォーマットを明示的に設定
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                
+                self.video_streaming = True
+                self.use_ffmpeg = False
+                
+                # ビデオフレーム取得スレッドを開始
+                video_thread = threading.Thread(target=self._capture_video_frames)
+                video_thread.daemon = True
+                video_thread.start()
+                
+                # 初期化時間を待機
+                await asyncio.sleep(2)
+                
+                # テストフレームを取得して動作確認
+                test_attempts = 0
+                while test_attempts < 5:
+                    if self.latest_frame is not None:
+                        logger.info("OpenCVビデオキャプチャが正常に動作しています")
+                        return True
+                    await asyncio.sleep(1)
+                    test_attempts += 1
+                
+                logger.warning("OpenCVでフレームを取得できませんでした")
+                self.video_streaming = False
+                if self.cap:
+                    self.cap.release()
+                    self.cap = None
+                return False
+            else:
+                logger.warning("OpenCVビデオキャプチャの初期化に失敗しました")
+                return False
+                
+        except Exception as e:
+            logger.error(f"OpenCVキャプチャエラー: {e}")
+            return False
+    
+    async def _start_ffmpeg_capture(self) -> bool:
+        """FFmpegを使用してビデオキャプチャを開始"""
+        try:
+            # FFmpegの利用可能性をチェック
+            try:
+                subprocess.run(['ffmpeg', '-version'], 
+                             stdout=subprocess.DEVNULL, 
+                             stderr=subprocess.DEVNULL, 
+                             check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                logger.error("FFmpegが見つかりません。FFmpegをインストールしてください。")
+                return False
+            
+            # FFmpegコマンドを構築
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', f'udp://0.0.0.0:{self.video_port}',
+                '-f', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-an',  # オーディオなし
+                '-sn',  # 字幕なし
+                '-vf', 'scale=960:720',  # スケール調整
+                '-r', '30',  # フレームレート
+                '-'
+            ]
+            
+            # FFmpegプロセスを開始
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**8
+            )
+            
+            self.video_streaming = True
+            self.use_ffmpeg = True
+            
+            # FFmpegフレーム取得スレッドを開始
+            video_thread = threading.Thread(target=self._capture_ffmpeg_frames)
+            video_thread.daemon = True
+            video_thread.start()
+            
+            # 初期化時間を待機
+            await asyncio.sleep(3)
+            
+            # テストフレームを取得して動作確認
+            test_attempts = 0
+            while test_attempts < 5:
+                if self.latest_frame is not None:
+                    logger.info("FFmpegビデオキャプチャが正常に動作しています")
+                    return True
+                await asyncio.sleep(1)
+                test_attempts += 1
+            
+            logger.warning("FFmpegでフレームを取得できませんでした")
+            self.video_streaming = False
+            if self.ffmpeg_process:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process = None
+            return False
+            
+        except Exception as e:
+            logger.error(f"FFmpegキャプチャエラー: {e}")
+            return False
+    
     async def stop_video_stream(self) -> Dict[str, Any]:
         """ビデオストリーミングを停止します"""
         try:
             self.video_streaming = False
             
+            # OpenCVキャプチャを停止
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            
+            # FFmpegプロセスを停止
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.terminate()
+                    self.ffmpeg_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait()
+                finally:
+                    self.ffmpeg_process = None
+            
+            self.use_ffmpeg = False
+            self.latest_frame = None
             
             # ビデオストリーミングを無効化
             if self.is_connected:
@@ -728,18 +862,96 @@ class AsyncTelloController:
             }
     
     def _capture_video_frames(self):
-        """ビデオフレームを継続的にキャプチャするスレッド"""
+        """ビデオフレームを継続的にキャプチャするスレッド（改善版）"""
+        consecutive_failures = 0
+        max_failures = 10
+        
         while self.video_streaming and self.cap and self.cap.isOpened():
             try:
                 ret, frame = self.cap.read()
-                if ret:
+                if ret and frame is not None:
+                    # フレームが正常に取得できた場合
+                    consecutive_failures = 0
                     with self.frame_lock:
                         self.latest_frame = frame
                 else:
-                    time.sleep(0.1)
+                    # フレーム取得に失敗した場合
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        logger.warning(f"連続してフレーム取得に失敗しました（{consecutive_failures}回）")
+                        # キャプチャを再初期化
+                        try:
+                            self.cap.release()
+                            time.sleep(1)
+                            self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
+                            if self.cap.isOpened():
+                                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                                consecutive_failures = 0
+                                logger.info("ビデオキャプチャを再初期化しました")
+                            else:
+                                logger.error("ビデオキャプチャの再初期化に失敗しました")
+                                break
+                        except Exception as reinit_e:
+                            logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+                            break
+                    else:
+                        time.sleep(0.1)
+                        
             except Exception as e:
                 logger.error(f"フレームキャプチャエラー: {e}")
-                break
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.error("フレームキャプチャエラーが多すぎるため、ビデオストリーミングを停止します")
+                    break
+                time.sleep(0.1)
+        
+        logger.info("ビデオフレームキャプチャスレッドが終了しました")
+    
+    def _capture_ffmpeg_frames(self):
+        """FFmpegからビデオフレームを継続的にキャプチャするスレッド"""
+        frame_width = 960
+        frame_height = 720
+        frame_size = frame_width * frame_height * 3  # BGR24
+        
+        consecutive_failures = 0
+        max_failures = 10
+        
+        while self.video_streaming and self.ffmpeg_process:
+            try:
+                # FFmpegからフレームデータを読み取り
+                raw_frame = self.ffmpeg_process.stdout.read(frame_size)
+                
+                if len(raw_frame) == frame_size:
+                    # バイトデータをnumpy配列に変換
+                    frame = np.frombuffer(raw_frame, dtype=np.uint8)
+                    frame = frame.reshape((frame_height, frame_width, 3))
+                    
+                    consecutive_failures = 0
+                    with self.frame_lock:
+                        self.latest_frame = frame
+                        
+                elif len(raw_frame) == 0:
+                    # プロセスが終了した
+                    logger.info("FFmpegプロセスが終了しました")
+                    break
+                else:
+                    # 不完全なフレーム
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        logger.warning(f"FFmpegから不完全なフレームを連続受信（{consecutive_failures}回）")
+                        break
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                logger.error(f"FFmpegフレームキャプチャエラー: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.error("FFmpegフレームキャプチャエラーが多すぎるため、ビデオストリーミングを停止します")
+                    break
+                time.sleep(0.1)
+        
+        logger.info("FFmpegビデオフレームキャプチャスレッドが終了しました")
     
     async def get_video_frame(self) -> Dict[str, Any]:
         """最新のビデオフレームをBase64エンコードして取得します"""
@@ -778,9 +990,24 @@ class AsyncTelloController:
             self.running = False
             self.video_streaming = False
             
+            # OpenCVキャプチャを停止
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            
+            # FFmpegプロセスを停止
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.terminate()
+                    self.ffmpeg_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait()
+                finally:
+                    self.ffmpeg_process = None
+            
+            self.use_ffmpeg = False
+            self.latest_frame = None
             
             if self.receive_thread and self.receive_thread.is_alive():
                 self.receive_thread.join(timeout=2)

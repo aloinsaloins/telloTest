@@ -2,6 +2,8 @@ import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
 import { google } from '@ai-sdk/google';
 import { z } from 'zod';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
 
 // Telloツールを作成
 const connectTello = createTool({
@@ -149,7 +151,15 @@ export const telloAgent = new Agent({
 4. 移動距離は20-500cmの範囲で指定してください
 5. 回転角度は1-360度の範囲で指定してください
 
+メモリ機能により、以下の情報を記憶します:
+- 過去の飛行セッション
+- バッテリー使用履歴
+- 実行したコマンド履歴
+- ユーザーの操作パターン
+- 安全に関する注意事項の確認状況
+
 ユーザーの指示に従って、安全にドローンを制御してください。
+過去の操作履歴を参考にして、より良いサポートを提供します。
 `,
   model: google('gemini-1.5-flash'),
   tools: {
@@ -164,5 +174,10 @@ export const telloAgent = new Agent({
     rotateDrone,
     startVideoStream,
     stopVideoStream
-  }
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: 'file:../mastra.db', // path is relative to the .mastra/output directory
+    }),
+  }),
 }); 
