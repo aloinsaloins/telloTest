@@ -33,11 +33,11 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
         }
       };
 
-      // 100ms間隔でフレームを取得（10 FPS）
-      intervalRef.current = setInterval(fetchFrame, 100);
+      // 200ms間隔でフレームを取得（5 FPS）- より安定した取得のため頻度を下げる
+      intervalRef.current = setInterval(fetchFrame, 200);
       
-      // 初回実行
-      fetchFrame();
+      // 初回実行は少し遅らせる
+      setTimeout(fetchFrame, 500);
     } else {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
@@ -122,7 +122,7 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
         )}
       </div>
       
-      <style jsx>{`
+      <style>{`
         .tello-video-stream {
           background: #f5f5f5;
           border-radius: 8px;

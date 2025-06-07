@@ -719,6 +719,9 @@ class AsyncTelloController:
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
                 # フォーマットを明示的に設定
                 self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                # より安定した設定を追加
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 
                 self.video_streaming = True
                 self.use_ffmpeg = False
@@ -729,11 +732,11 @@ class AsyncTelloController:
                 video_thread.start()
                 
                 # 初期化時間を待機
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 
                 # テストフレームを取得して動作確認
                 test_attempts = 0
-                while test_attempts < 5:
+                while test_attempts < 10:
                     if self.latest_frame is not None:
                         logger.info("OpenCVビデオキャプチャが正常に動作しています")
                         return True
@@ -801,7 +804,7 @@ class AsyncTelloController:
             
             # テストフレームを取得して動作確認
             test_attempts = 0
-            while test_attempts < 5:
+            while test_attempts < 10:
                 if self.latest_frame is not None:
                     logger.info("FFmpegビデオキャプチャが正常に動作しています")
                     return True
@@ -865,28 +868,39 @@ class AsyncTelloController:
         """ビデオフレームを継続的にキャプチャするスレッド（改善版）"""
         consecutive_failures = 0
         max_failures = 10
+        frame_skip_count = 0
         
         while self.video_streaming and self.cap and self.cap.isOpened():
             try:
                 ret, frame = self.cap.read()
-                if ret and frame is not None:
+                if ret and frame is not None and frame.size > 0:
                     # フレームが正常に取得できた場合
                     consecutive_failures = 0
-                    with self.frame_lock:
-                        self.latest_frame = frame
+                    frame_skip_count = 0
+                    
+                    # フレームサイズをチェック
+                    if frame.shape[0] > 0 and frame.shape[1] > 0:
+                        with self.frame_lock:
+                            self.latest_frame = frame
                 else:
                     # フレーム取得に失敗した場合
                     consecutive_failures += 1
+                    frame_skip_count += 1
+                    
+                    # 連続失敗が多い場合は再初期化
                     if consecutive_failures >= max_failures:
                         logger.warning(f"連続してフレーム取得に失敗しました（{consecutive_failures}回）")
                         # キャプチャを再初期化
                         try:
                             self.cap.release()
-                            time.sleep(1)
+                            time.sleep(2)
                             self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
                             if self.cap.isOpened():
                                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                                 self.cap.set(cv2.CAP_PROP_FPS, 30)
+                                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+                                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                                 consecutive_failures = 0
                                 logger.info("ビデオキャプチャを再初期化しました")
                             else:
@@ -896,13 +910,14 @@ class AsyncTelloController:
                             logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
                             break
                     else:
-                        time.sleep(0.1)
+                        # 短時間待機してリトライ
+                        time.sleep(0.05)
                         
             except Exception as e:
                 logger.error(f"フレームキャプチャエラー: {e}")
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
-                    logger.error("フレームキャプチャエラーが多すぎるため、ビデオストリーミングを停止します")
+                    logger.error("フレームキャプチャエラーが多すぎるため、スレッドを終了します")
                     break
                 time.sleep(0.1)
         
@@ -1168,8 +1183,67 @@ async def handle_direct_command(message: str) -> str:
     message_lower = message.lower()
     responses = []
     
+    # 複雑な複数コマンドの処理: 「ビデオストリーミングを開始して、離陸して、前に50cm進んで、着陸して、ビデオを停止して」
+    if ("ビデオ" in message and "開始" in message and 
+        "離陸" in message and 
+        ("前" in message or "進" in message) and 
+        "着陸" in message and 
+        ("停止" in message or "ビデオ" in message)):
+        
+        logger.info("複雑な複数コマンド処理: ビデオ開始 + 離陸 + 移動 + 着陸 + ビデオ停止")
+        
+        # 1. ビデオストリーミング開始
+        logger.info("Telloビデオストリーミング開始コマンドを実行中...")
+        video_start_result = await tello_controller.start_video_stream()
+        if video_start_result.get('success', False):
+            responses.append("✅ ビデオストリーミングを開始しました。")
+            await asyncio.sleep(2)  # ビデオ安定化のため待機
+        else:
+            responses.append("❌ ビデオストリーミングの開始に失敗しました。")
+        
+        # 2. 離陸
+        logger.info("Tello離陸コマンドを実行中...")
+        takeoff_result = await tello_controller.takeoff()
+        if takeoff_result.get('success', False):
+            responses.append("✅ 離陸に成功しました。")
+            await asyncio.sleep(3)  # 離陸安定化のため待機
+        else:
+            responses.append("❌ 離陸に失敗しました。")
+        
+        # 3. 前進移動
+        import re
+        distance_match = re.search(r'(\d+)\s*cm', message)
+        distance = int(distance_match.group(1)) if distance_match else 50
+        
+        logger.info(f"Tello前進移動コマンドを実行中... 距離: {distance}cm")
+        move_result = await tello_controller.move('forward', distance)
+        if move_result.get('success', False):
+            responses.append(f"✅ 前に{distance}cm移動しました。")
+            await asyncio.sleep(2)  # 移動安定化のため待機
+        else:
+            responses.append(f"❌ 前への移動に失敗しました。")
+        
+        # 4. 着陸
+        logger.info("Tello着陸コマンドを実行中...")
+        land_result = await tello_controller.land()
+        if land_result.get('success', False):
+            responses.append("✅ 着陸に成功しました。")
+            await asyncio.sleep(3)  # 着陸安定化のため待機
+        else:
+            responses.append("❌ 着陸に失敗しました。")
+        
+        # 5. ビデオストリーミング停止
+        logger.info("Telloビデオストリーミング停止コマンドを実行中...")
+        video_stop_result = await tello_controller.stop_video_stream()
+        if video_stop_result.get('success', False):
+            responses.append("✅ ビデオストリーミングを停止しました。")
+        else:
+            responses.append("❌ ビデオストリーミングの停止に失敗しました。")
+        
+        return "\n".join(responses)
+    
     # 複数コマンドの処理: 「離陸して、20cm右に動いて」のようなケース
-    if "離陸" in message and "右" in message and ("移動" in message or "動" in message):
+    elif "離陸" in message and "右" in message and ("移動" in message or "動" in message):
         logger.info("複数コマンド処理: 離陸 + 右移動")
         
         # 1. 離陸
@@ -1177,6 +1251,7 @@ async def handle_direct_command(message: str) -> str:
         takeoff_result = await tello_controller.takeoff()
         if takeoff_result.get('success', False):
             responses.append("✅ 離陸に成功しました。")
+            await asyncio.sleep(3)  # 離陸安定化のため待機
             
             # 2. 右移動
             import re
@@ -1222,6 +1297,24 @@ async def handle_direct_command(message: str) -> str:
         else:
             return "❌ 着陸に失敗しました。"
     
+    elif ("ビデオ" in message or "video" in message_lower) and ("開始" in message or "start" in message_lower):
+        logger.info("Telloビデオストリーミング開始コマンドを実行中...")
+        video_result = await tello_controller.start_video_stream()
+        success = video_result.get('success', False)
+        if success:
+            return "✅ ビデオストリーミングを開始しました。"
+        else:
+            return "❌ ビデオストリーミングの開始に失敗しました。"
+    
+    elif ("ビデオ" in message or "video" in message_lower) and ("停止" in message or "stop" in message_lower):
+        logger.info("Telloビデオストリーミング停止コマンドを実行中...")
+        video_result = await tello_controller.stop_video_stream()
+        success = video_result.get('success', False)
+        if success:
+            return "✅ ビデオストリーミングを停止しました。"
+        else:
+            return "❌ ビデオストリーミングの停止に失敗しました。"
+    
     elif "右" in message and ("移動" in message or "動" in message):
         logger.info("Tello右移動コマンドを実行中...")
         # 距離を抽出（デフォルト20cm）
@@ -1235,13 +1328,26 @@ async def handle_direct_command(message: str) -> str:
         else:
             return f"❌ 右への移動に失敗しました。"
     
+    elif "前" in message and ("移動" in message or "動" in message or "進" in message):
+        logger.info("Tello前進移動コマンドを実行中...")
+        # 距離を抽出（デフォルト50cm）
+        import re
+        distance_match = re.search(r'(\d+)\s*cm', message)
+        distance = int(distance_match.group(1)) if distance_match else 50
+        move_result = await tello_controller.move('forward', distance)
+        success = move_result.get('success', False)
+        if success:
+            return f"✅ 前に{distance}cm移動しました。"
+        else:
+            return f"❌ 前への移動に失敗しました。"
+    
     elif "状態" in message or "status" in message_lower:
         logger.info("Telloステータス確認中...")
         status_result = await tello_controller.get_status()
         return f"📊 ドローンの状態: {status_result}"
     
     else:
-        return "❌ Telloに接続されていません。まず「接続して」と言ってください。"
+        return "❌ 認識できないコマンドです。まず「接続して」と言ってください。"
 
 async def copilotkit_handler(request: web.Request) -> web.Response:
     """AG-UI/CopilotKit APIエンドポイント - Mastraエージェントとの通信"""
