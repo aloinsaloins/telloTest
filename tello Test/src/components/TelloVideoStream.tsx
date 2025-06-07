@@ -38,6 +38,9 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
       
       // 初回実行は少し遅らせる
       setTimeout(fetchFrame, 500);
+      
+      // ビデオストリーミング開始時にGUIウィンドウを表示
+      console.log('📹 ビデオストリーミングが開始されました - GUIに映像を表示します');
     } else {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
@@ -104,16 +107,24 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
         )}
         
         {isStreaming && frame ? (
-          <img
-            src={`data:image/jpeg;base64,${frame}`}
-            alt="Tello Live Stream"
-            className="video-frame"
-          />
+          <div className="video-active">
+            <img
+              src={`data:image/jpeg;base64,${frame}`}
+              alt="Tello Live Stream"
+              className="video-frame"
+            />
+            <div className="streaming-indicator">
+              <span className="live-badge">🔴 LIVE</span>
+            </div>
+          </div>
         ) : (
           <div className="no-video">
             <div className="placeholder">
               {isStreaming ? (
-                <p>📹 ビデオフレームを読み込み中...</p>
+                <div className="loading-state">
+                  <p>📹 ビデオフレームを読み込み中...</p>
+                  <div className="loading-spinner"></div>
+                </div>
               ) : (
                 <p>📷 ビデオストリーミングが停止中</p>
               )}
@@ -187,10 +198,42 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
           justify-content: center;
         }
         
+        .video-active {
+          position: relative;
+          width: 100%;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        
         .video-frame {
           max-width: 100%;
           max-height: 100%;
           object-fit: contain;
+        }
+        
+        .streaming-indicator {
+          position: absolute;
+          top: 8px;
+          right: 8px;
+          z-index: 10;
+        }
+        
+        .live-badge {
+          background: rgba(244, 67, 54, 0.9);
+          color: white;
+          padding: 4px 8px;
+          border-radius: 4px;
+          font-size: 12px;
+          font-weight: bold;
+          animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+          0% { opacity: 1; }
+          50% { opacity: 0.7; }
+          100% { opacity: 1; }
         }
         
         .no-video {
@@ -209,6 +252,27 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
         .placeholder p {
           margin: 0;
           font-size: 16px;
+        }
+        
+        .loading-state {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 16px;
+        }
+        
+        .loading-spinner {
+          width: 32px;
+          height: 32px;
+          border: 3px solid #f3f3f3;
+          border-top: 3px solid #4CAF50;
+          border-radius: 50%;
+          animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
         }
         
         .error-message {

@@ -6,6 +6,7 @@ interface TelloStatus {
   connected: boolean;
   flight_status: string;
   battery: number;
+  video_streaming?: boolean;
 }
 
 function App() {
@@ -13,7 +14,8 @@ function App() {
   const [telloStatus, setTelloStatus] = useState<TelloStatus>({
     connected: false,
     flight_status: 'landed',
-    battery: 0
+    battery: 0,
+    video_streaming: false
   });
   const [isConnecting, setIsConnecting] = useState(false);
 
@@ -27,8 +29,14 @@ function App() {
           setTelloStatus({
             connected: data.connected,
             flight_status: data.flight_status,
-            battery: data.battery
+            battery: data.battery,
+            video_streaming: data.video_streaming || false
           });
+          
+          // ビデオストリーミング状態をGUIに反映
+          if (data.video_streaming !== undefined) {
+            setIsVideoStreaming(data.video_streaming);
+          }
         }
       } catch (error) {
         console.error('Status update error:', error);
@@ -178,7 +186,7 @@ function App() {
           </div>
         </div>
 
-        <style jsx>{`
+        <style>{`
           .app {
             min-height: 100vh;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
