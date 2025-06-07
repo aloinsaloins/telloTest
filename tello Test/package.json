@@ -16,7 +16,10 @@
     "tello:ai:takeoff": "node --import tsx/esm src/tello-natural-language.ts \"ドローンを離陸させて\"",
     "tello:ai:land": "node --import tsx/esm src/tello-natural-language.ts \"着陸して\"",
     "tello:ai:forward": "node --import tsx/esm src/tello-natural-language.ts \"前に100cm進んで\"",
-    "tello:ai:rotate": "node --import tsx/esm src/tello-natural-language.ts \"右に90度回転して\""
+    "tello:ai:rotate": "node --import tsx/esm src/tello-natural-language.ts \"右に90度回転して\"",
+    "web:dev": "vite",
+    "web:build": "vite build",
+    "web:preview": "vite preview"
   },
   "keywords": [
     "tello",
@@ -38,15 +41,22 @@
     "@mastra/libsql": "^0.10.1",
     "@mastra/loggers": "^0.10.0",
     "@mastra/memory": "^0.10.2",
+    "@mastra/agui": "^1.0.2",
     "dgram": "^1.0.1",
     "dotenv": "^16.5.0",
     "tello-drone": "^3.0.6",
-    "zod": "^3.25.55"
+    "zod": "^3.25.55",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
     "mastra": "^0.10.3",
     "tsx": "^4.19.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vite": "^6.0.7"
   }
 }

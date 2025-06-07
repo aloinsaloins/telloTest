@@ -22,6 +22,8 @@ import threading
 import cv2
 from datetime import datetime
 import contextlib
+import base64
+import time
 
 # ログ設定 - INFOレベル以上を出力（重要な情報のみ）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,6 +59,9 @@ class AsyncTelloController:
         
         # ビデオキャプチャ
         self.cap: Optional[cv2.VideoCapture] = None
+        self.video_streaming = False
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
         
         # 接続状態
         self.is_connected = False
@@ -651,10 +656,127 @@ class AsyncTelloController:
         if len(self.operation_log) > 100:
             self.operation_log = self.operation_log[-100:]
     
+    async def start_video_stream(self) -> Dict[str, Any]:
+        """ビデオストリーミングを開始します"""
+        if not self.is_connected:
+            return {"success": False, "message": "Telloに接続されていません"}
+        
+        try:
+            # ビデオストリーミングを有効化
+            response = await self._send_command('streamon')
+            
+            if 'ok' in response.lower():
+                # OpenCVでビデオキャプチャを開始
+                self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
+                
+                if self.cap.isOpened():
+                    self.video_streaming = True
+                    # ビデオフレーム取得スレッドを開始
+                    video_thread = threading.Thread(target=self._capture_video_frames)
+                    video_thread.daemon = True
+                    video_thread.start()
+                    
+                    logger.info("ビデオストリーミングを開始しました")
+                    return {
+                        "success": True,
+                        "message": "ビデオストリーミングを開始しました",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": "ビデオキャプチャの初期化に失敗しました"
+                    }
+            else:
+                return {
+                    "success": False,
+                    "message": f"ビデオストリーミングの開始に失敗しました: {response}"
+                }
+                
+        except Exception as e:
+            logger.error(f"ビデオストリーミング開始エラー: {e}")
+            return {
+                "success": False,
+                "message": f"ビデオストリーミング開始エラー: {e}"
+            }
+    
+    async def stop_video_stream(self) -> Dict[str, Any]:
+        """ビデオストリーミングを停止します"""
+        try:
+            self.video_streaming = False
+            
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            
+            # ビデオストリーミングを無効化
+            if self.is_connected:
+                response = await self._send_command('streamoff')
+                logger.info("ビデオストリーミングを停止しました")
+            
+            return {
+                "success": True,
+                "message": "ビデオストリーミングを停止しました",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"ビデオストリーミング停止エラー: {e}")
+            return {
+                "success": False,
+                "message": f"ビデオストリーミング停止エラー: {e}"
+            }
+    
+    def _capture_video_frames(self):
+        """ビデオフレームを継続的にキャプチャするスレッド"""
+        while self.video_streaming and self.cap and self.cap.isOpened():
+            try:
+                ret, frame = self.cap.read()
+                if ret:
+                    with self.frame_lock:
+                        self.latest_frame = frame
+                else:
+                    time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"フレームキャプチャエラー: {e}")
+                break
+    
+    async def get_video_frame(self) -> Dict[str, Any]:
+        """最新のビデオフレームをBase64エンコードして取得します"""
+        if not self.video_streaming or self.latest_frame is None:
+            return {
+                "success": False,
+                "message": "ビデオストリーミングが開始されていません"
+            }
+        
+        try:
+            with self.frame_lock:
+                frame = self.latest_frame.copy()
+            
+            # フレームをJPEGエンコード
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            
+            # Base64エンコード
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            
+            return {
+                "success": True,
+                "frame": frame_base64,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"フレーム取得エラー: {e}")
+            return {
+                "success": False,
+                "message": f"フレーム取得エラー: {e}"
+            }
+
     async def disconnect(self):
         """Telloから切断します"""
         try:
             self.running = False
+            self.video_streaming = False
             
             if self.cap:
                 self.cap.release()
@@ -799,6 +921,133 @@ async def rotate_handler(request: web.Request) -> web.Response:
             status=500
         )
 
+async def start_video_handler(request: web.Request) -> web.Response:
+    """ビデオストリーミング開始エンドポイント"""
+    result = await tello_controller.start_video_stream()
+    return web.json_response(result)
+
+async def stop_video_handler(request: web.Request) -> web.Response:
+    """ビデオストリーミング停止エンドポイント"""
+    result = await tello_controller.stop_video_stream()
+    return web.json_response(result)
+
+async def video_frame_handler(request: web.Request) -> web.Response:
+    """ビデオフレーム取得エンドポイント"""
+    result = await tello_controller.get_video_frame()
+    return web.json_response(result)
+
+async def copilotkit_handler(request: web.Request) -> web.Response:
+    """AG-UI/CopilotKit APIエンドポイント - Mastraエージェントとの通信"""
+    try:
+        # リクエストボディを取得
+        body = await request.json()
+        messages = body.get('messages', [])
+        thread_id = body.get('threadId', 'default')
+        resource_id = body.get('resourceId', 'user')
+        
+        logger.info(f"CopilotKit request: {len(messages)} messages, thread: {thread_id}")
+        
+        # 実際のTello制御を実行
+        if not messages:
+            response_text = "メッセージが空です。何かご質問はありますか？"
+        else:
+            last_message = messages[-1].get('content', '')
+            logger.info(f"Last message: {last_message}")
+            
+            # 実際のTello制御コマンドを実行
+            if 'こんにちは' in last_message or 'hello' in last_message.lower():
+                response_text = "こんにちは！Telloドローンの制御をお手伝いします。\n\n例:\n- 「ドローンに接続して」\n- 「離陸して」\n- 「前に100cm進んで」\n- 「着陸して」\n\n何をお手伝いしましょうか？"
+            elif '接続' in last_message:
+                logger.info("Tello接続コマンドを実行中...")
+                connect_result = await tello_controller.connect()
+                if connect_result['success']:
+                    response_text = f"✅ Telloドローンに正常に接続されました！\n\nバッテリー残量: {connect_result.get('battery', 0)}%\n\n次に何をしますか？\n- 「離陸して」\n- 「ビデオストリーミングを開始して」"
+                else:
+                    response_text = f"❌ Tello接続に失敗しました: {connect_result.get('message', '不明なエラー')}\n\n以下を確認してください：\n- TelloのWiFiに接続されているか\n- Telloの電源が入っているか\n- 192.168.10.1にpingが通るか"
+            elif '離陸' in last_message:
+                if not tello_controller.is_connected:
+                    response_text = "❌ Telloに接続されていません。まず「接続して」と言ってください。"
+                else:
+                    logger.info("Tello離陸コマンドを実行中...")
+                    takeoff_result = await tello_controller.takeoff()
+                    if takeoff_result['success']:
+                        response_text = "🛫 離陸しました！\n\n次に何をしますか？\n- 「前に100cm進んで」\n- 「右に90度回転して」\n- 「着陸して」"
+                    else:
+                        response_text = f"❌ 離陸に失敗しました: {takeoff_result.get('message', '不明なエラー')}"
+            elif '着陸' in last_message:
+                if not tello_controller.is_connected:
+                    response_text = "❌ Telloに接続されていません。"
+                else:
+                    logger.info("Tello着陸コマンドを実行中...")
+                    land_result = await tello_controller.land()
+                    if land_result['success']:
+                        response_text = "🛬 安全に着陸しました！"
+                    else:
+                        response_text = f"❌ 着陸に失敗しました: {land_result.get('message', '不明なエラー')}"
+            elif 'バッテリー' in last_message:
+                if not tello_controller.is_connected:
+                    response_text = "❌ Telloに接続されていません。まず「接続して」と言ってください。"
+                else:
+                    logger.info("Telloバッテリー確認中...")
+                    battery_result = await tello_controller.get_battery()
+                    if battery_result['success']:
+                        battery_level = battery_result.get('battery', 0)
+                        if battery_level > 50:
+                            response_text = f"🔋 バッテリー残量: {battery_level}% - 十分です！"
+                        elif battery_level > 20:
+                            response_text = f"🔋 バッテリー残量: {battery_level}% - 注意が必要です"
+                        else:
+                            response_text = f"🔋 バッテリー残量: {battery_level}% - ⚠️ 低残量！充電をお勧めします"
+                    else:
+                        response_text = f"❌ バッテリー確認に失敗しました: {battery_result.get('message', '不明なエラー')}"
+            elif 'ビデオ' in last_message or '映像' in last_message:
+                if not tello_controller.is_connected:
+                    response_text = "❌ Telloに接続されていません。まず「接続して」と言ってください。"
+                else:
+                    if '開始' in last_message or 'スタート' in last_message:
+                        logger.info("Telloビデオストリーミング開始中...")
+                        video_result = await tello_controller.start_video_stream()
+                        if video_result['success']:
+                            response_text = "📹 ビデオストリーミングを開始しました！左側の画面で映像を確認できます。"
+                        else:
+                            response_text = f"❌ ビデオストリーミング開始に失敗しました: {video_result.get('message', '不明なエラー')}"
+                    elif '停止' in last_message:
+                        logger.info("Telloビデオストリーミング停止中...")
+                        video_result = await tello_controller.stop_video_stream()
+                        if video_result['success']:
+                            response_text = "📹 ビデオストリーミングを停止しました。"
+                        else:
+                            response_text = f"❌ ビデオストリーミング停止に失敗しました: {video_result.get('message', '不明なエラー')}"
+                    else:
+                        response_text = "ビデオストリーミングを制御します。「ビデオストリーミングを開始して」または「ビデオストリーミングを停止して」と言ってください。"
+            elif '緊急' in last_message or '停止' in last_message:
+                if not tello_controller.is_connected:
+                    response_text = "❌ Telloに接続されていません。"
+                else:
+                    logger.info("Tello緊急停止コマンドを実行中...")
+                    emergency_result = await tello_controller.emergency()
+                    if emergency_result['success']:
+                        response_text = "🚨 緊急停止を実行しました！ドローンのモーターを停止しました。"
+                    else:
+                        response_text = f"❌ 緊急停止に失敗しました: {emergency_result.get('message', '不明なエラー')}"
+            else:
+                response_text = f"「{last_message}」について理解しました。\n\nTelloドローンの制御に関して、以下のような操作が可能です：\n- 接続・切断\n- 離陸・着陸\n- 移動（前後左右上下）\n- 回転\n- バッテリー確認\n- ビデオストリーミング\n- 緊急停止\n\n具体的にどのような操作をご希望ですか？"
+        
+        return web.json_response({
+            "success": True,
+            "text": response_text,
+            "toolCalls": [],
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"CopilotKit API error: {e}")
+        return web.json_response({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }, status=500)
+
 async def health_handler(request: web.Request) -> web.Response:
     """ヘルスチェックエンドポイント"""
     return web.json_response({
@@ -828,7 +1077,7 @@ def setup_cors(app):
                 headers={
                     'Access-Control-Allow-Origin': '*',  # 本番環境では特定のドメインに制限することを推奨
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
                 }
             )
         
@@ -836,11 +1085,29 @@ def setup_cors(app):
             response = await handler(request)
             response.headers['Access-Control-Allow-Origin'] = '*'  # 本番環境では特定のドメインに制限することを推奨
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
             return response
+        except web.HTTPMethodNotAllowed as e:
+            logger.error(f"Method not allowed: {request.method} {request.path}")
+            return web.json_response({
+                "error": f"Method {request.method} not allowed for {request.path}",
+                "allowed_methods": ["GET", "POST", "OPTIONS"]
+            }, status=405, headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+            })
         except Exception as e:
             logger.error(f"CORS middleware error: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+            return web.json_response({
+                "error": str(e),
+                "path": request.path,
+                "method": request.method
+            }, status=500, headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+            })
     
     app.middlewares.append(cors_middleware)
 
@@ -848,8 +1115,22 @@ def create_app() -> web.Application:
     """Webアプリケーションを作成します"""
     app = web.Application()
     
-    # ルート設定
+    # ルート設定（/api/ プレフィックス付き）
     app.router.add_get('/health', health_handler)
+    app.router.add_post('/api/connect', connect_handler)
+    app.router.add_post('/api/disconnect', disconnect_handler)
+    app.router.add_get('/api/status', status_handler)
+    app.router.add_get('/api/battery', battery_handler)
+    app.router.add_post('/api/takeoff', takeoff_handler)
+    app.router.add_post('/api/land', land_handler)
+    app.router.add_post('/api/emergency', emergency_handler)
+    app.router.add_post('/api/move', move_handler)
+    app.router.add_post('/api/rotate', rotate_handler)
+    app.router.add_post('/api/video/start', start_video_handler)
+    app.router.add_post('/api/video/stop', stop_video_handler)
+    app.router.add_get('/api/video/frame', video_frame_handler)
+    
+    # 後方互換性のため、/api/ なしのエンドポイントも維持
     app.router.add_post('/connect', connect_handler)
     app.router.add_post('/disconnect', disconnect_handler)
     app.router.add_get('/status', status_handler)
@@ -859,8 +1140,41 @@ def create_app() -> web.Application:
     app.router.add_post('/emergency', emergency_handler)
     app.router.add_post('/move', move_handler)
     app.router.add_post('/rotate', rotate_handler)
+    app.router.add_post('/video/start', start_video_handler)
+    app.router.add_post('/video/stop', stop_video_handler)
+    app.router.add_get('/video/frame', video_frame_handler)
     
-    # OPTIONS用のルート設定
+    # AG-UI/CopilotKit API
+    app.router.add_post('/api/copilotkit', copilotkit_handler)
+    app.router.add_options('/api/copilotkit', cors_handler)
+    
+    # OPTIONS用のルート設定（/api/ プレフィックス付き）
+    app.router.add_options('/api/connect', cors_handler)
+    app.router.add_options('/api/disconnect', cors_handler)
+    app.router.add_options('/api/status', cors_handler)
+    app.router.add_options('/api/battery', cors_handler)
+    app.router.add_options('/api/takeoff', cors_handler)
+    app.router.add_options('/api/land', cors_handler)
+    app.router.add_options('/api/emergency', cors_handler)
+    app.router.add_options('/api/move', cors_handler)
+    app.router.add_options('/api/rotate', cors_handler)
+    app.router.add_options('/api/video/start', cors_handler)
+    app.router.add_options('/api/video/stop', cors_handler)
+    app.router.add_options('/api/video/frame', cors_handler)
+    
+    # 後方互換性のため、/api/ なしのOPTIONSも維持
+    app.router.add_options('/connect', cors_handler)
+    app.router.add_options('/disconnect', cors_handler)
+    app.router.add_options('/status', cors_handler)
+    app.router.add_options('/battery', cors_handler)
+    app.router.add_options('/takeoff', cors_handler)
+    app.router.add_options('/land', cors_handler)
+    app.router.add_options('/emergency', cors_handler)
+    app.router.add_options('/move', cors_handler)
+    app.router.add_options('/rotate', cors_handler)
+    app.router.add_options('/video/start', cors_handler)
+    app.router.add_options('/video/stop', cors_handler)
+    app.router.add_options('/video/frame', cors_handler)
     app.router.add_options('/{path:.*}', cors_handler)
     
     return app
@@ -877,6 +1191,25 @@ async def main():
     logger.info(f"Tello Web Controller started on http://{host}:{port}")
     logger.info("Ready to control Tello drone via HTTP API")
     logger.info("バイナリデータフィルタリング機能が有効です")
+    logger.info("AG-UI/CopilotKit APIエンドポイント: /api/copilotkit")
+    
+    # 利用可能なエンドポイントを表示
+    logger.info("Available endpoints:")
+    logger.info("  GET  /health - ヘルスチェック")
+    logger.info("  POST /api/connect - Tello接続")
+    logger.info("  POST /api/disconnect - Tello切断")
+    logger.info("  GET  /api/status - ドローン状態")
+    logger.info("  GET  /api/battery - バッテリー残量")
+    logger.info("  POST /api/takeoff - 離陸")
+    logger.info("  POST /api/land - 着陸")
+    logger.info("  POST /api/emergency - 緊急停止")
+    logger.info("  POST /api/move - 移動")
+    logger.info("  POST /api/rotate - 回転")
+    logger.info("  POST /api/video/start - ビデオ開始")
+    logger.info("  POST /api/video/stop - ビデオ停止")
+    logger.info("  GET  /api/video/frame - フレーム取得")
+    logger.info("  POST /api/copilotkit - AG-UI API")
+    logger.info("  (後方互換性のため /api/ なしのエンドポイントも利用可能)")
     
     # サーバー起動
     runner = web.AppRunner(app)
