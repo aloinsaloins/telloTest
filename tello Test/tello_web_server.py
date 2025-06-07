@@ -664,6 +664,42 @@ class AsyncTelloController:
 tello_controller = AsyncTelloController()
 
 # HTTP APIハンドラー
+async def _parse_request_params(request: web.Request, param_names: list) -> dict:
+    """Parse parameters from JSON body or query string"""
+    logger.info(f"Content-Type: {request.content_type}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    
+    body_text = await request.text()
+    logger.info(f"Request body: '{body_text}'")
+    
+    if body_text.strip() and (request.content_type == 'application/json' or body_text.strip().startswith('{')):
+        try:
+            data = json.loads(body_text)
+            params = {name: data.get(name) for name in param_names}
+            logger.info(f"JSON解析成功: {params}")
+            return params
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON解析エラー: {e}")
+            raise web.HTTPBadRequest(
+                text=json.dumps({"success": False, "message": f"無効なJSON形式です: {str(e)}"}),
+                content_type='application/json'
+            )
+    else:
+        params = {name: request.query.get(name) for name in param_names}
+        logger.info(f"クエリパラメータ使用: {params}")
+        
+        if any(params[name] is None for name in param_names):
+            missing = [name for name in param_names if params[name] is None]
+            raise web.HTTPBadRequest(
+                text=json.dumps({
+                    "success": False, 
+                    "message": f"必要なパラメータ（{', '.join(missing)}）が不足しています。"
+                }),
+                content_type='application/json'
+            )
+        
+        return params
+
 async def connect_handler(request: web.Request) -> web.Response:
     """接続エンドポイント"""
     result = await tello_controller.connect()
@@ -702,56 +738,16 @@ async def emergency_handler(request: web.Request) -> web.Response:
 async def move_handler(request: web.Request) -> web.Response:
     """移動エンドポイント"""
     try:
-        # デバッグ情報をログ出力
-        logger.info(f"Content-Type: {request.content_type}")
-        logger.info(f"Headers: {dict(request.headers)}")
+        params = await _parse_request_params(request, ['direction', 'distance'])
         
-        # JSONボディまたはクエリパラメータから取得
-        # まずボディの内容を確認
-        body_text = await request.text()
-        logger.info(f"Request body: '{body_text}'")
+        # Convert distance to int
+        distance = int(params['distance'])
         
-        if body_text.strip() and (request.content_type == 'application/json' or body_text.strip().startswith('{')):
-            # JSONボディから取得
-            try:
-                data = json.loads(body_text)
-                direction = data.get('direction')
-                distance = data.get('distance', 0)
-                logger.info(f"JSON解析成功: direction={direction}, distance={distance}")
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON解析エラー: {e}")
-                return web.json_response(
-                    {"success": False, "message": f"無効なJSON形式です: {str(e)}"}, 
-                    status=400
-                )
-        else:
-            # クエリパラメータから取得
-            direction = request.query.get('direction')
-            distance = request.query.get('distance')
-            logger.info(f"クエリパラメータ使用: direction={direction}, distance={distance}")
-            
-            # パラメータが不足している場合のエラーハンドリング
-            if not direction or distance is None:
-                return web.json_response(
-                    {"success": False, "message": "JSONボディが空で、必要なパラメータ（direction, distance）が不足しています。JSONボディまたはクエリパラメータで送信してください。"}, 
-                    status=400
-                )
-        
-        # distanceを数値に変換
-        if isinstance(distance, str):
-            distance = int(distance)
-        elif not isinstance(distance, (int, float)):
-            raise ValueError("distanceは数値で指定してください")
-        
-        if not direction:
-            return web.json_response(
-                {"success": False, "message": "directionパラメータが必要です"}, 
-                status=400
-            )
-        
-        result = await tello_controller.move(direction, int(distance))
+        result = await tello_controller.move(params['direction'], distance)
         return web.json_response(result)
         
+    except web.HTTPBadRequest:
+        raise
     except ValueError as e:
         return web.json_response(
             {"success": False, "message": f"distanceは数値で指定してください: {str(e)}"}, 
@@ -766,56 +762,16 @@ async def move_handler(request: web.Request) -> web.Response:
 async def rotate_handler(request: web.Request) -> web.Response:
     """回転エンドポイント"""
     try:
-        # デバッグ情報をログ出力
-        logger.info(f"Content-Type: {request.content_type}")
-        logger.info(f"Headers: {dict(request.headers)}")
+        params = await _parse_request_params(request, ['direction', 'degrees'])
         
-        # JSONボディまたはクエリパラメータから取得
-        # まずボディの内容を確認
-        body_text = await request.text()
-        logger.info(f"Request body: '{body_text}'")
+        # Convert degrees to int
+        degrees = int(params['degrees'])
         
-        if body_text.strip() and (request.content_type == 'application/json' or body_text.strip().startswith('{')):
-            # JSONボディから取得
-            try:
-                data = json.loads(body_text)
-                direction = data.get('direction')
-                degrees = data.get('degrees', 0)
-                logger.info(f"JSON解析成功: direction={direction}, degrees={degrees}")
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON解析エラー: {e}")
-                return web.json_response(
-                    {"success": False, "message": f"無効なJSON形式です: {str(e)}"}, 
-                    status=400
-                )
-        else:
-            # クエリパラメータから取得
-            direction = request.query.get('direction')
-            degrees = request.query.get('degrees')
-            logger.info(f"クエリパラメータ使用: direction={direction}, degrees={degrees}")
-            
-            # パラメータが不足している場合のエラーハンドリング
-            if not direction or degrees is None:
-                return web.json_response(
-                    {"success": False, "message": "JSONボディが空で、必要なパラメータ（direction, degrees）が不足しています。JSONボディまたはクエリパラメータで送信してください。"}, 
-                    status=400
-                )
-        
-        # degreesを数値に変換
-        if isinstance(degrees, str):
-            degrees = int(degrees)
-        elif not isinstance(degrees, (int, float)):
-            raise ValueError("degreesは数値で指定してください")
-        
-        if not direction:
-            return web.json_response(
-                {"success": False, "message": "directionパラメータが必要です"}, 
-                status=400
-            )
-        
-        result = await tello_controller.rotate(direction, int(degrees))
+        result = await tello_controller.rotate(params['direction'], degrees)
         return web.json_response(result)
         
+    except web.HTTPBadRequest:
+        raise
     except ValueError as e:
         return web.json_response(
             {"success": False, "message": f"degreesは数値で指定してください: {str(e)}"}, 
