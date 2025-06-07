@@ -19,7 +19,6 @@ from aiohttp import web
 from typing import Dict, Any, Optional
 import socket
 import threading
-import queue
 import cv2
 from datetime import datetime
 import contextlib
@@ -46,12 +45,15 @@ class AsyncTelloController:
         
         # ソケット初期化
         self.socket = None
-        self.response_queue = queue.Queue()
+        self.response_queue = None  # asyncio.Queueに変更
         self.receive_thread = None
         self.running = False
         
         # コマンド実行の直列化用ロック
         self.command_lock = asyncio.Lock()
+        
+        # イベントループの参照を保持
+        self.loop = None
         
         # ビデオキャプチャ
         self.cap: Optional[cv2.VideoCapture] = None
@@ -68,6 +70,12 @@ class AsyncTelloController:
         """Telloに接続します"""
         try:
             logger.debug("Telloに接続中...")
+            
+            # 現在のイベントループを保存
+            self.loop = asyncio.get_running_loop()
+            
+            # asyncio.Queueを初期化
+            self.response_queue = asyncio.Queue()
             
             # ソケット初期化
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -146,31 +154,28 @@ class AsyncTelloController:
                 while not self.response_queue.empty():
                     try:
                         self.response_queue.get_nowait()
-                    except queue.Empty:
+                    except asyncio.QueueEmpty:
                         break
                 
                 # コマンド送信
                 self.socket.sendto(command.encode('utf-8'), (self.tello_ip, self.tello_port))
                 
                 # 応答を待機（非同期）
-                for _ in range(timeout * 10):  # 0.1秒間隔でチェック
-                    try:
-                        response = self.response_queue.get_nowait()
-                        logger.debug(f"応答: {response}")
-                        return response
-                    except queue.Empty:
-                        await asyncio.sleep(0.1)
-                
-                logger.warning(f"コマンドタイムアウト: {command}")
-                
-                # タイムアウト時の自動再接続（commandコマンド以外で実行）
-                if retry_on_timeout and command != 'command':
-                    logger.info("タイムアウトのため自動再接続を試行します...")
-                    # 再接続は別のロック取得が必要なので、ここではretry_on_timeout=Falseで再実行
-                    # 実際の再接続は呼び出し元で処理
+                try:
+                    response = await asyncio.wait_for(self.response_queue.get(), timeout=timeout)
+                    logger.debug(f"応答: {response}")
+                    return response
+                except asyncio.TimeoutError:
+                    logger.warning(f"コマンドタイムアウト: {command}")
+                    
+                    # タイムアウト時の自動再接続（commandコマンド以外で実行）
+                    if retry_on_timeout and command != 'command':
+                        logger.info("タイムアウトのため自動再接続を試行します...")
+                        # 再接続は別のロック取得が必要なので、ここではretry_on_timeout=Falseで再実行
+                        # 実際の再接続は呼び出し元で処理
+                        return "timeout"
+                    
                     return "timeout"
-                
-                return "timeout"
                 
             except Exception as e:
                 logger.error(f"コマンド送信エラー: {e}")
@@ -208,7 +213,12 @@ class AsyncTelloController:
                     continue
                 
                 logger.debug(f"受信: {response_str}")
-                self.response_queue.put(response_str)
+                # asyncio.Queueにスレッドセーフに追加
+                if self.loop and not self.loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(
+                        self.response_queue.put(response_str), 
+                        self.loop
+                    )
                 
             except socket.timeout:
                 continue
@@ -274,6 +284,12 @@ class AsyncTelloController:
             
             # ソケット再初期化
             try:
+                # 現在のイベントループを保存
+                self.loop = asyncio.get_running_loop()
+                
+                # 新しいasyncio.Queueを作成
+                self.response_queue = asyncio.Queue()
+                
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self.socket.bind((self.local_ip, self.local_port))
