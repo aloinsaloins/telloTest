@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "接続して"
+    }
+  ],
+  "threadId": "test-thread",
+  "resourceId": "test-user"
+} 

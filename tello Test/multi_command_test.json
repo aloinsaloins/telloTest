@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "離陸して、20cm右に動いて"
+    }
+  ],
+  "threadId": "test-thread-multi",
+  "resourceId": "test-user"
+} 
