@@ -362,6 +362,123 @@ export const telloGetBattery = new Tool({
   },
 });
 
+/**
+ * Telloドローンのビデオストリーミングを開始するツール
+ */
+export const telloStartVideoStream = new Tool({
+  id: 'tello_start_video_stream',
+  description: 'DJI Telloドローンのビデオストリーミングを開始します。カメラ映像をリアルタイムで配信開始します',
+  inputSchema: z.object({}),
+  execute: async () => {
+    try {
+      const response = await fetch(`${TELLO_API_BASE_URL}/video/start`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        return {
+          success: true,
+          message: 'Telloのビデオストリーミングを開始しました。カメラ映像の配信が始まりました',
+          data: result,
+        };
+      } else {
+        return {
+          success: false,
+          message: `ビデオストリーミング開始に失敗しました: ${result.message}`,
+          data: result,
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        message: `ビデオストリーミング開始エラー: ${error}`,
+        data: null,
+      };
+    }
+  },
+});
+
+/**
+ * Telloドローンのビデオストリーミングを停止するツール
+ */
+export const telloStopVideoStream = new Tool({
+  id: 'tello_stop_video_stream',
+  description: 'DJI Telloドローンのビデオストリーミングを停止します。カメラ映像の配信を終了します',
+  inputSchema: z.object({}),
+  execute: async () => {
+    try {
+      const response = await fetch(`${TELLO_API_BASE_URL}/video/stop`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        return {
+          success: true,
+          message: 'Telloのビデオストリーミングを停止しました。カメラ映像の配信が終了しました',
+          data: result,
+        };
+      } else {
+        return {
+          success: false,
+          message: `ビデオストリーミング停止に失敗しました: ${result.message}`,
+          data: result,
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        message: `ビデオストリーミング停止エラー: ${error}`,
+        data: null,
+      };
+    }
+  },
+});
+
+/**
+ * Telloドローンの現在のビデオフレームを取得するツール
+ */
+export const telloGetVideoFrame = new Tool({
+  id: 'tello_get_video_frame',
+  description: 'DJI Telloドローンの現在のビデオフレーム（静止画）を取得します。ビデオストリーミングが開始されている必要があります',
+  inputSchema: z.object({}),
+  execute: async () => {
+    try {
+      const response = await fetch(`${TELLO_API_BASE_URL}/video/frame`);
+      const result = await response.json();
+      
+      if (result.success) {
+        return {
+          success: true,
+          message: 'ビデオフレームを取得しました',
+          data: result,
+        };
+      } else {
+        return {
+          success: false,
+          message: `ビデオフレーム取得に失敗しました: ${result.message}`,
+          data: result,
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        message: `ビデオフレーム取得エラー: ${error}`,
+        data: null,
+      };
+    }
+  },
+});
+
 // すべてのTelloツールをエクスポート
 export const telloTools = [
   telloConnect,
@@ -373,4 +490,7 @@ export const telloTools = [
   telloMove,
   telloRotate,
   telloGetBattery,
+  telloStartVideoStream,
+  telloStopVideoStream,
+  telloGetVideoFrame,
 ]; 
