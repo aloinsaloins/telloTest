@@ -19,11 +19,10 @@ from aiohttp import web
 from typing import Dict, Any, Optional
 import socket
 import threading
-import time
 import queue
 import cv2
-import numpy as np
 from datetime import datetime
+import contextlib
 
 # ログ設定 - INFOレベル以上を出力（重要な情報のみ）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -222,7 +221,7 @@ class AsyncTelloController:
         """受信データがバイナリデータかどうかを判定"""
         # 非ASCII文字が多い場合はバイナリとみなす
         try:
-            decoded = data.decode('ascii')
+            data.decode('ascii')
             # ASCII文字のみで構成されていればテキスト
             return False
         except UnicodeDecodeError:
@@ -257,10 +256,7 @@ class AsyncTelloController:
             pass
         
         # その他のパターン（状態文字列など）
-        if len(text) > 50:  # 長すぎる文字列は状態データの可能性
-            return False
-        
-        return True
+        return len(text) <= 50  # 長すぎる文字列は状態データの可能性
     
     async def _auto_reconnect(self) -> bool:
         """自動再接続を試行します（ロック競合回避版）"""
@@ -270,10 +266,8 @@ class AsyncTelloController:
             # 現在の接続をクリーンアップ
             self.is_connected = False
             if self.socket:
-                try:
+                with contextlib.suppress(Exception):
                     self.socket.close()
-                except:
-                    pass
             
             # 少し待機
             await asyncio.sleep(1)
@@ -304,7 +298,7 @@ class AsyncTelloController:
                     try:
                         battery_response = await self._send_command('battery?', timeout=5, retry_on_timeout=False)
                         self.last_battery = int(battery_response) if battery_response.isdigit() else 0
-                    except:
+                    except Exception:
                         self.last_battery = 0
                     
                     return True
@@ -512,7 +506,7 @@ class AsyncTelloController:
             elif "motor stop" in response.lower():
                 return {
                     "success": False,
-                    "message": f"移動に失敗しました: モーターが停止しています。ドローンが着陸しているか、障害物を検知した可能性があります。",
+                    "message": "移動に失敗しました: モーターが停止しています。ドローンが着陸しているか、障害物を検知した可能性があります。",
                     "raw_response": response,
                     "timestamp": datetime.now().isoformat()
                 }
@@ -846,7 +840,7 @@ async def cors_handler(request: web.Request) -> web.Response:
     """CORS preflight対応"""
     return web.Response(
         headers={
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': '*',  # 本番環境では特定のドメインに制限することを推奨
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type',
         }
@@ -860,7 +854,7 @@ def setup_cors(app):
         if request.method == 'OPTIONS':
             return web.Response(
                 headers={
-                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Origin': '*',  # 本番環境では特定のドメインに制限することを推奨
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                     'Access-Control-Allow-Headers': 'Content-Type',
                 }
@@ -868,7 +862,7 @@ def setup_cors(app):
         
         try:
             response = await handler(request)
-            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Origin'] = '*'  # 本番環境では特定のドメインに制限することを推奨
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
             response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
             return response
