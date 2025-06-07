@@ -16,7 +16,7 @@ import {
 // メモリインスタンスを作成
 const memory = new Memory({
   options: {
-    lastMessages: 10, // 最新の10件のメッセージを保持
+    lastMessages: 20, // 最新の20件のメッセージを保持
   },
 });
 
