@@ -33,11 +33,11 @@ export const TelloVideoStream: React.FC<TelloVideoStreamProps> = ({
         }
       };
 
-      // 200ms間隔でフレームを取得（5 FPS）- より安定した取得のため頻度を下げる
-      intervalRef.current = setInterval(fetchFrame, 200);
+      // 66ms間隔でフレームを取得（15 FPS）- さらなるフレームレート向上
+      intervalRef.current = setInterval(fetchFrame, 66);
       
       // 初回実行は少し遅らせる
-      setTimeout(fetchFrame, 500);
+      setTimeout(fetchFrame, 200);
       
       // ビデオストリーミング開始時にGUIウィンドウを表示
       console.log('📹 ビデオストリーミングが開始されました - GUIに映像を表示します');

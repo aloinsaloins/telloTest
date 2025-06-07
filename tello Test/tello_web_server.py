@@ -374,20 +374,61 @@ class AsyncTelloController:
         if self.flight_status == "flying":
             return {"success": False, "message": "既に飛行中です"}
         
-        logger.debug("離陸中...")
-        response = await self._send_command('takeoff', timeout=15)
+        logger.info("離陸を開始します...")
+        response = await self._send_command('takeoff', timeout=25)  # タイムアウトを25秒に延長
         
         if 'ok' in response.lower():
             self.flight_status = "flying"
             self._log_operation("takeoff", {"status": "success"})
+            logger.info("離陸に成功しました")
             return {
                 "success": True,
                 "message": "離陸に成功しました",
                 "flight_status": self.flight_status,
                 "timestamp": datetime.now().isoformat()
             }
+        elif response == "timeout":
+            self._log_operation("takeoff", {"status": "timeout"})
+            
+            # 自動再接続を試行
+            logger.info("離陸コマンドタイムアウト、自動再接続を試行します...")
+            reconnect_success = await self._auto_reconnect()
+            
+            if reconnect_success:
+                logger.info("再接続成功、離陸コマンドを再実行します")
+                # 再接続後にコマンドを再実行
+                retry_response = await self._send_command('takeoff', timeout=25, retry_on_timeout=False)
+                
+                if 'ok' in retry_response.lower():
+                    self.flight_status = "flying"
+                    self._log_operation("takeoff", {"status": "success_after_reconnect"})
+                    logger.info("再接続後に離陸に成功しました")
+                    return {
+                        "success": True,
+                        "message": "再接続後に離陸に成功しました",
+                        "flight_status": self.flight_status,
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    logger.error(f"再接続後も離陸に失敗: {retry_response}")
+                    return {
+                        "success": False,
+                        "message": f"再接続後も離陸に失敗しました: {retry_response}",
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            else:
+                logger.error("離陸コマンドタイムアウト、自動再接続にも失敗")
+                return {
+                    "success": False,
+                    "message": "離陸コマンドがタイムアウトし、自動再接続にも失敗しました。ドローンの状態を確認してください。",
+                    "reconnected": False,
+                    "timestamp": datetime.now().isoformat()
+                }
         else:
             self._log_operation("takeoff", {"status": "failed", "response": response})
+            logger.error(f"離陸に失敗: {response}")
             return {
                 "success": False,
                 "message": f"離陸に失敗しました: {response}",
@@ -760,9 +801,9 @@ class AsyncTelloController:
                 self.cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
                 
                 if self.cap.isOpened():
-                    # OpenCVの設定を最適化（より安定した設定）
+                    # OpenCVの設定を最適化（フレームレート向上）
                     self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # バッファサイズを最小に
-                    self.cap.set(cv2.CAP_PROP_FPS, 15)  # フレームレートを下げて安定性向上
+                    self.cap.set(cv2.CAP_PROP_FPS, 30)  # フレームレートを向上
                     
                     # タイムアウト設定を追加
                     self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)  # 5秒タイムアウト
@@ -791,7 +832,7 @@ class AsyncTelloController:
                         if self.latest_frame is not None:
                             logger.info(f"OpenCVビデオキャプチャが正常に動作しています ({stream_url})")
                             return True
-                        await asyncio.sleep(0.5)  # 待機時間を短縮
+                        await asyncio.sleep(0.2)  # 待機時間をさらに短縮
                         test_attempts += 1
                     
                     # このストリームURLでは失敗、次を試行
@@ -842,7 +883,7 @@ class AsyncTelloController:
                     '-an',  # オーディオなし
                     '-sn',  # 字幕なし
                     '-vf', 'scale=640:480',  # より小さい解像度で安定性向上
-                    '-r', '15',  # フレームレートを下げる
+                    '-r', '25',  # フレームレートを向上
                     '-'
                 ],
                 # 設定2: より堅牢な設定
@@ -858,7 +899,7 @@ class AsyncTelloController:
                     '-an',
                     '-sn',
                     '-vf', 'scale=640:480',
-                    '-r', '10',
+                    '-r', '20',
                     '-'
                 ]
             ]
@@ -1079,6 +1120,9 @@ class AsyncTelloController:
                                 self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
                                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
                                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                                # フレームレート向上のための追加設定
+                                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                                self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
                                 consecutive_failures = 0
                                 logger.info("ビデオキャプチャを再初期化しました")
                             else:
@@ -1088,11 +1132,35 @@ class AsyncTelloController:
                             logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
                             break
                     else:
-                        # 短時間待機してリトライ
-                        time.sleep(0.05)
+                        # より短時間待機してリトライ（フレームレート向上）
+                        time.sleep(0.01)
                         
             except Exception as e:
-                logger.error(f"フレームキャプチャエラー: {e}")
+                error_msg = str(e)
+                # OpenCVの特定のエラーを詳細に処理
+                if "Unknown C++ exception" in error_msg:
+                    logger.error("OpenCVでC++例外が発生しました。ビデオストリームを再初期化します。")
+                    try:
+                        if self.cap:
+                            self.cap.release()
+                        time.sleep(1)
+                        # より堅牢な再初期化
+                        self.cap = cv2.VideoCapture(f'udp://0.0.0.0:{self.video_port}', cv2.CAP_FFMPEG)
+                        if self.cap.isOpened():
+                            # 基本設定のみ適用（エラーを避けるため）
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            consecutive_failures = 0
+                            logger.info("OpenCVビデオキャプチャを再初期化しました")
+                            continue
+                        else:
+                            logger.error("OpenCVビデオキャプチャの再初期化に失敗")
+                            break
+                    except Exception as reinit_e:
+                        logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+                        break
+                else:
+                    logger.error(f"フレームキャプチャエラー: {e}")
+                
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
                     logger.error("フレームキャプチャエラーが多すぎるため、スレッドを終了します")
@@ -1230,8 +1298,8 @@ class AsyncTelloController:
             with self.frame_lock:
                 frame = self.latest_frame.copy()
             
-            # フレームをJPEGエンコード
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # フレームをJPEGエンコード（品質を下げて高速化）
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
             
             # Base64エンコード
             frame_base64 = base64.b64encode(buffer).decode('utf-8')
