@@ -107,7 +107,9 @@ async def interactive_test():
     
     async with aiohttp.ClientSession() as session:
         while True:
-            command = input("\nコマンドを入力 > ").strip().lower()
+            command = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: input("\nコマンドを入力 > ").strip().lower()
+            )
             
             if command == 'quit':
                 break
