@@ -73,7 +73,7 @@ async def test_tello_api():
         
         print("\nテスト完了！")
 
-def test_connection_monitoring():
+async def test_connection_monitoring():
     """接続監視テスト（バイナリデータフィルタリング効果確認）"""
     print("\n接続監視テスト（10秒間）")
     print("このテストでバイナリデータのフィルタリング効果を確認します")
@@ -161,7 +161,7 @@ def main():
     elif choice == '2':
         print("\n注意: Webサーバーを起動してTelloに接続してから実行してください")
         input("準備ができたらEnterキーを押してください...")
-        test_connection_monitoring()
+        asyncio.run(test_connection_monitoring())
     elif choice == '3':
         print("\n注意: Webサーバー (tello_web_server.py) が起動していることを確認してください")
         input("準備ができたらEnterキーを押してください...")
