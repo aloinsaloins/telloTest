@@ -238,16 +238,18 @@ export const telloMove = new Tool({
     direction: z.enum(['up', 'down', 'left', 'right', 'forward', 'back']).describe('移動方向（up: 上昇, down: 下降, left: 左, right: 右, forward: 前進, back: 後退）'),
     distance: z.number().min(20).max(500).describe('移動距離（センチメートル、20-500の範囲）'),
   }),
-  execute: async ({ context }) => {
+  execute: async ({ direction, distance }) => {
     try {
-      const { direction, distance } = context;
-      const response = await fetch(`${TELLO_API_BASE_URL}/move?direction=${direction}&distance=${distance}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-      
+      const response = await fetch(
+        `${TELLO_API_BASE_URL}/move?direction=${direction}&distance=${distance}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+      // …
       const result = await response.json();
       
       if (result.success) {
