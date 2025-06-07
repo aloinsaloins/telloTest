@@ -64,8 +64,10 @@ export const telloDisconnect = new Tool({
       const result = await response.json();
       
       return {
-        success: true,
-        message: 'Telloから切断しました',
+        success: result.success,
+        message: result.success
+          ? 'Telloから切断しました'
+          : `切断に失敗しました: ${result.message}`,
         data: result,
       };
     } catch (error) {
