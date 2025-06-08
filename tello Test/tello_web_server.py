@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 from aiohttp import web
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import socket
 import threading
 import cv2
@@ -740,6 +740,27 @@ class AsyncTelloController:
         if len(self.operation_log) > 100:
             self.operation_log = self.operation_log[-100:]
     
+    async def _try_video_capture_methods(self) -> Tuple[bool, str]:
+        """Try different video capture methods and return success status and method name."""
+        capture_methods = [
+            ("OpenCV", self._start_opencv_capture),
+            ("FFmpeg", self._start_ffmpeg_capture),
+            ("Simple UDP", self._start_simple_udp_capture)
+        ]
+        
+        for method_name, method_func in capture_methods:
+            logger.info(f"{method_name}でビデオキャプチャを試行中...")
+            try:
+                success = await method_func()
+                if success:
+                    logger.info(f"✅ {method_name}でビデオストリーミングを開始しました")
+                    return True, method_name
+            except Exception as method_e:
+                logger.error(f"{method_name}でエラー: {method_e}")
+                continue
+        
+        return False, ""
+
     async def start_video_stream(self) -> Dict[str, Any]:
         """ビデオストリーミングを開始します（改善版）"""
         if not self.is_connected:
@@ -780,27 +801,14 @@ class AsyncTelloController:
             await asyncio.sleep(3)
             
             # 複数の方法でビデオキャプチャを試行
-            capture_methods = [
-                ("OpenCV", self._start_opencv_capture),
-                ("FFmpeg", self._start_ffmpeg_capture),
-                ("Simple UDP", self._start_simple_udp_capture)
-            ]
-            
-            for method_name, method_func in capture_methods:
-                logger.info(f"{method_name}でビデオキャプチャを試行中...")
-                try:
-                    success = await method_func()
-                    if success:
-                        logger.info(f"✅ {method_name}でビデオストリーミングを開始しました")
-                        return {
-                            "success": True,
-                            "message": f"{method_name}でビデオストリーミングを開始しました",
-                            "method": method_name.lower(),
-                            "timestamp": datetime.now().isoformat()
-                        }
-                except Exception as method_e:
-                    logger.error(f"{method_name}でエラー: {method_e}")
-                    continue
+            success, method_name = await self._try_video_capture_methods()
+            if success:
+                return {
+                    "success": True,
+                    "message": f"{method_name}でビデオストリーミングを開始しました",
+                    "method": method_name.lower(),
+                    "timestamp": datetime.now().isoformat()
+                }
             
             # すべての方法が失敗した場合
             logger.error("すべてのビデオキャプチャ方法が失敗しました")
@@ -1105,6 +1113,51 @@ class AsyncTelloController:
                 "message": f"ビデオストリーミング停止エラー: {e}"
             }
     
+    def _reinitialize_video_capture(self) -> bool:
+        """Re-initialize video capture after failures."""
+        try:
+            if self.cap:
+                self.cap.release()
+            time.sleep(2)
+            self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                # フレームレート向上のための追加設定
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+                logger.info("ビデオキャプチャを再初期化しました")
+                return True
+            else:
+                logger.error("ビデオキャプチャの再初期化に失敗しました")
+                return False
+        except Exception as reinit_e:
+            logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+            return False
+
+    def _reinitialize_opencv_capture_robust(self) -> bool:
+        """Re-initialize OpenCV capture with robust settings after C++ exceptions."""
+        try:
+            if self.cap:
+                self.cap.release()
+            time.sleep(1)
+            # より堅牢な再初期化
+            self.cap = cv2.VideoCapture(f'udp://0.0.0.0:{self.video_port}', cv2.CAP_FFMPEG)
+            if self.cap.isOpened():
+                # 基本設定のみ適用（エラーを避けるため）
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                logger.info("OpenCVビデオキャプチャを再初期化しました")
+                return True
+            else:
+                logger.error("OpenCVビデオキャプチャの再初期化に失敗")
+                return False
+        except Exception as reinit_e:
+            logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+            return False
+
     def _capture_video_frames(self):
         """ビデオフレームを継続的にキャプチャするスレッド（改善版）"""
         consecutive_failures = 0
@@ -1141,27 +1194,9 @@ class AsyncTelloController:
                     # 連続失敗が多い場合は再初期化
                     if consecutive_failures >= max_failures:
                         logger.warning(f"連続してフレーム取得に失敗しました（{consecutive_failures}回）")
-                        # キャプチャを再初期化
-                        try:
-                            self.cap.release()
-                            time.sleep(2)
-                            self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
-                            if self.cap.isOpened():
-                                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                self.cap.set(cv2.CAP_PROP_FPS, 30)
-                                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
-                                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-                                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                                # フレームレート向上のための追加設定
-                                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                                self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-                                consecutive_failures = 0
-                                logger.info("ビデオキャプチャを再初期化しました")
-                            else:
-                                logger.error("ビデオキャプチャの再初期化に失敗しました")
-                                break
-                        except Exception as reinit_e:
-                            logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+                        if self._reinitialize_video_capture():
+                            consecutive_failures = 0
+                        else:
                             break
                     else:
                         # より短時間待機してリトライ（フレームレート向上）
@@ -1172,23 +1207,10 @@ class AsyncTelloController:
                 # OpenCVの特定のエラーを詳細に処理
                 if "Unknown C++ exception" in error_msg:
                     logger.error("OpenCVでC++例外が発生しました。ビデオストリームを再初期化します。")
-                    try:
-                        if self.cap:
-                            self.cap.release()
-                        time.sleep(1)
-                        # より堅牢な再初期化
-                        self.cap = cv2.VideoCapture(f'udp://0.0.0.0:{self.video_port}', cv2.CAP_FFMPEG)
-                        if self.cap.isOpened():
-                            # 基本設定のみ適用（エラーを避けるため）
-                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                            consecutive_failures = 0
-                            logger.info("OpenCVビデオキャプチャを再初期化しました")
-                            continue
-                        else:
-                            logger.error("OpenCVビデオキャプチャの再初期化に失敗")
-                            break
-                    except Exception as reinit_e:
-                        logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+                    if self._reinitialize_opencv_capture_robust():
+                        consecutive_failures = 0
+                        continue
+                    else:
                         break
                 else:
                     logger.error(f"フレームキャプチャエラー: {e}")
