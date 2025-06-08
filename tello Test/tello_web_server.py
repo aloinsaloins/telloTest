@@ -1791,8 +1791,6 @@ async def call_mastra_agent(message: str, thread_id: str, resource_id: str) -> s
     """Mastraエージェントを呼び出す"""
     try:
         import aiohttp
-        import json
-        
         mastra_url = "http://localhost:4111/api/agents/telloAgent/generate"
         logger.info(f"🚀 Calling Mastra agent: {message}")
         
