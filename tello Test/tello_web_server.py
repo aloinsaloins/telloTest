@@ -366,13 +366,45 @@ class AsyncTelloController:
                 "raw_response": response
             }
     
+    async def reset_flight_status(self) -> Dict[str, Any]:
+        """飛行状態をリセットします（デバッグ用）"""
+        old_status = self.flight_status
+        self.flight_status = "landed"
+        self._log_operation("reset_flight_status", {"old_status": old_status, "new_status": "landed"})
+        logger.info(f"飛行状態をリセットしました: {old_status} -> landed")
+        return {
+            "success": True,
+            "message": f"飛行状態をリセットしました: {old_status} -> landed",
+            "old_status": old_status,
+            "new_status": "landed",
+            "timestamp": datetime.now().isoformat()
+        }
+
     async def takeoff(self) -> Dict[str, Any]:
         """離陸します"""
         if not self.is_connected:
             return {"success": False, "message": "Telloに接続されていません"}
         
         if self.flight_status == "flying":
-            return {"success": False, "message": "既に飛行中です"}
+            # 状態確認のため実際のドローンの状態をチェック
+            logger.warning("飛行状態が'flying'になっていますが、実際の状態を確認します...")
+            
+            # 実際にTelloに状態確認コマンドを送信
+            try:
+                state_response = await self._send_command('battery?', timeout=3)
+                if state_response == "timeout" or state_response == "error":
+                    # 通信できない場合は状態をリセット
+                    logger.info("ドローンとの通信ができないため、状態をリセットします")
+                    self.flight_status = "landed"
+                else:
+                    # 通信できる場合は、強制的に着陸コマンドを送信してから離陸
+                    logger.info("安全のため、まず着陸コマンドを送信します")
+                    await self._send_command('land', timeout=5)
+                    await asyncio.sleep(2)  # 少し待機
+                    self.flight_status = "landed"
+            except Exception as e:
+                logger.warning(f"状態確認中にエラー: {e}")
+                self.flight_status = "landed"
         
         logger.info("離陸を開始します...")
         response = await self._send_command('takeoff', timeout=25)  # タイムアウトを25秒に延長
@@ -1443,6 +1475,11 @@ async def emergency_handler(request: web.Request) -> web.Response:
     result = await tello_controller.emergency()
     return web.json_response(result)
 
+async def reset_status_handler(request: web.Request) -> web.Response:
+    """飛行状態リセットエンドポイント"""
+    result = await tello_controller.reset_flight_status()
+    return web.json_response(result)
+
 async def move_handler(request: web.Request) -> web.Response:
     """移動エンドポイント"""
     try:
@@ -1776,6 +1813,326 @@ async def health_handler(request: web.Request) -> web.Response:
         "timestamp": datetime.now().isoformat()
     })
 
+async def index_handler(request: web.Request) -> web.Response:
+    """メインページのハンドラー"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tello Web Controller</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: white;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 30px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+        .status-panel {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .control-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .control-section {
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 15px;
+            padding: 20px;
+        }
+        .control-section h3 {
+            margin-top: 0;
+            color: #fff;
+            text-align: center;
+        }
+        button {
+            background: linear-gradient(45deg, #ff6b6b, #ee5a24);
+            border: none;
+            color: white;
+            padding: 12px 24px;
+            margin: 5px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .emergency-btn {
+            background: linear-gradient(45deg, #e74c3c, #c0392b) !important;
+            font-size: 18px !important;
+            padding: 15px 30px !important;
+        }
+        .connect-btn {
+            background: linear-gradient(45deg, #2ecc71, #27ae60) !important;
+        }
+        .video-section {
+            text-align: center;
+            margin-top: 30px;
+        }
+        #videoFrame {
+            max-width: 100%;
+            border-radius: 15px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        .api-info {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            margin-top: 30px;
+        }
+        .api-info h3 {
+            color: #fff;
+        }
+        .api-info code {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-connected { background-color: #2ecc71; }
+        .status-disconnected { background-color: #e74c3c; }
+        .status-unknown { background-color: #f39c12; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚁 Tello Web Controller</h1>
+        
+        <div class="status-panel">
+            <h2>ドローン状態</h2>
+            <div id="status">
+                <span class="status-indicator status-unknown"></span>
+                <span id="statusText">状態を確認中...</span>
+            </div>
+            <div id="battery" style="margin-top: 10px;">バッテリー: 確認中...</div>
+        </div>
+
+        <div class="control-grid">
+            <div class="control-section">
+                <h3>接続制御</h3>
+                <button class="connect-btn" onclick="connect()">接続</button>
+                <button onclick="disconnect()">切断</button>
+                <button onclick="resetStatus()">状態リセット</button>
+            </div>
+
+            <div class="control-section">
+                <h3>基本操作</h3>
+                <button onclick="takeoff()">離陸</button>
+                <button onclick="land()">着陸</button>
+                <button class="emergency-btn" onclick="emergency()">緊急停止</button>
+            </div>
+
+            <div class="control-section">
+                <h3>移動制御</h3>
+                <button onclick="move('forward', 50)">前進</button>
+                <button onclick="move('back', 50)">後退</button>
+                <button onclick="move('left', 50)">左移動</button>
+                <button onclick="move('right', 50)">右移動</button>
+                <button onclick="move('up', 50)">上昇</button>
+                <button onclick="move('down', 50)">下降</button>
+            </div>
+
+            <div class="control-section">
+                <h3>回転制御</h3>
+                <button onclick="rotate('cw', 90)">右回転</button>
+                <button onclick="rotate('ccw', 90)">左回転</button>
+            </div>
+
+            <div class="control-section">
+                <h3>ビデオ制御</h3>
+                <button onclick="startVideo()">ビデオ開始</button>
+                <button onclick="stopVideo()">ビデオ停止</button>
+                <button onclick="refreshVideo()">フレーム更新</button>
+            </div>
+        </div>
+
+        <div class="video-section">
+            <h3>ライブビデオ</h3>
+            <img id="videoFrame" src="" alt="ビデオフレームが表示されます" style="display: none;">
+            <div id="videoStatus">ビデオを開始してください</div>
+        </div>
+
+        <div class="api-info">
+            <h3>API情報</h3>
+            <p>このコントローラーは以下のAPIエンドポイントを提供します：</p>
+            <ul>
+                <li><code>GET /health</code> - ヘルスチェック</li>
+                <li><code>POST /api/connect</code> - Tello接続</li>
+                <li><code>GET /api/status</code> - ドローン状態</li>
+                <li><code>GET /api/battery</code> - バッテリー残量</li>
+                <li><code>POST /api/takeoff</code> - 離陸</li>
+                <li><code>POST /api/land</code> - 着陸</li>
+                <li><code>POST /api/emergency</code> - 緊急停止</li>
+                <li><code>POST /api/copilotkit</code> - AG-UI API</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // 状態更新
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                const statusElement = document.getElementById('statusText');
+                const indicator = document.querySelector('.status-indicator');
+                
+                if (data.success) {
+                    statusElement.textContent = `接続済み - ${data.status || '不明'}`;
+                    indicator.className = 'status-indicator status-connected';
+                } else {
+                    statusElement.textContent = '未接続';
+                    indicator.className = 'status-indicator status-disconnected';
+                }
+            } catch (error) {
+                document.getElementById('statusText').textContent = 'エラー';
+                document.querySelector('.status-indicator').className = 'status-indicator status-unknown';
+            }
+        }
+
+        // バッテリー更新
+        async function updateBattery() {
+            try {
+                const response = await fetch('/api/battery');
+                const data = await response.json();
+                document.getElementById('battery').textContent = 
+                    data.success ? `バッテリー: ${data.battery}%` : 'バッテリー: 不明';
+            } catch (error) {
+                document.getElementById('battery').textContent = 'バッテリー: エラー';
+            }
+        }
+
+        // API呼び出し関数
+        async function apiCall(endpoint, method = 'POST', body = null) {
+            try {
+                const options = { method };
+                if (body) {
+                    options.headers = { 'Content-Type': 'application/json' };
+                    options.body = JSON.stringify(body);
+                }
+                
+                const response = await fetch(endpoint, options);
+                const data = await response.json();
+                
+                if (data.success) {
+                    alert(`成功: ${data.message || '操作完了'}`);
+                } else {
+                    alert(`エラー: ${data.error || '不明なエラー'}`);
+                }
+                
+                // 状態を更新
+                updateStatus();
+                updateBattery();
+            } catch (error) {
+                alert(`通信エラー: ${error.message}`);
+            }
+        }
+
+        // 制御関数
+        async function connect() { await apiCall('/api/connect'); }
+        async function disconnect() { await apiCall('/api/disconnect'); }
+        async function takeoff() { await apiCall('/api/takeoff'); }
+        async function land() { await apiCall('/api/land'); }
+        async function emergency() { await apiCall('/api/emergency'); }
+        async function resetStatus() { await apiCall('/api/reset_status'); }
+        
+        async function move(direction, distance) {
+            await apiCall('/api/move', 'POST', { direction, distance });
+        }
+        
+        async function rotate(direction, degrees) {
+            await apiCall('/api/rotate', 'POST', { direction, degrees });
+        }
+
+        async function startVideo() {
+            await apiCall('/api/video/start');
+            setTimeout(refreshVideo, 1000); // 1秒後にフレーム取得
+        }
+
+        async function stopVideo() {
+            await apiCall('/api/video/stop');
+            document.getElementById('videoFrame').style.display = 'none';
+            document.getElementById('videoStatus').textContent = 'ビデオを開始してください';
+        }
+
+        async function refreshVideo() {
+            try {
+                const response = await fetch('/api/video/frame');
+                const data = await response.json();
+                
+                if (data.success && data.frame) {
+                    const img = document.getElementById('videoFrame');
+                    img.src = `data:image/jpeg;base64,${data.frame}`;
+                    img.style.display = 'block';
+                    document.getElementById('videoStatus').textContent = 'ライブビデオ表示中';
+                } else {
+                    document.getElementById('videoStatus').textContent = 'フレーム取得失敗';
+                }
+            } catch (error) {
+                document.getElementById('videoStatus').textContent = `ビデオエラー: ${error.message}`;
+            }
+        }
+
+        // 定期更新
+        setInterval(updateStatus, 5000);
+        setInterval(updateBattery, 10000);
+        
+        // 初期化
+        updateStatus();
+        updateBattery();
+        
+        // ビデオの自動更新（ビデオが表示されている場合）
+        setInterval(() => {
+            const img = document.getElementById('videoFrame');
+            if (img.style.display !== 'none') {
+                refreshVideo();
+            }
+        }, 1000);
+    </script>
+</body>
+</html>
+    """
+    return web.Response(text=html_content, content_type='text/html')
+
 # CORS対応
 async def cors_handler(request: web.Request) -> web.Response:
     """CORS preflight対応"""
@@ -1835,6 +2192,9 @@ def create_app() -> web.Application:
     """Webアプリケーションを作成します"""
     app = web.Application()
     
+    # メインページ
+    app.router.add_get('/', index_handler)
+    
     # ルート設定（/api/ プレフィックス付き）
     app.router.add_get('/health', health_handler)
     app.router.add_post('/api/connect', connect_handler)
@@ -1844,6 +2204,7 @@ def create_app() -> web.Application:
     app.router.add_post('/api/takeoff', takeoff_handler)
     app.router.add_post('/api/land', land_handler)
     app.router.add_post('/api/emergency', emergency_handler)
+    app.router.add_post('/api/reset_status', reset_status_handler)
     app.router.add_post('/api/move', move_handler)
     app.router.add_post('/api/rotate', rotate_handler)
     app.router.add_post('/api/video/start', start_video_handler)
@@ -1859,6 +2220,7 @@ def create_app() -> web.Application:
     app.router.add_post('/takeoff', takeoff_handler)
     app.router.add_post('/land', land_handler)
     app.router.add_post('/emergency', emergency_handler)
+    app.router.add_post('/reset_status', reset_status_handler)
     app.router.add_post('/move', move_handler)
     app.router.add_post('/rotate', rotate_handler)
     app.router.add_post('/video/start', start_video_handler)
@@ -1878,6 +2240,7 @@ def create_app() -> web.Application:
     app.router.add_options('/api/takeoff', cors_handler)
     app.router.add_options('/api/land', cors_handler)
     app.router.add_options('/api/emergency', cors_handler)
+    app.router.add_options('/api/reset_status', cors_handler)
     app.router.add_options('/api/move', cors_handler)
     app.router.add_options('/api/rotate', cors_handler)
     app.router.add_options('/api/video/start', cors_handler)
@@ -1892,6 +2255,7 @@ def create_app() -> web.Application:
     app.router.add_options('/takeoff', cors_handler)
     app.router.add_options('/land', cors_handler)
     app.router.add_options('/emergency', cors_handler)
+    app.router.add_options('/reset_status', cors_handler)
     app.router.add_options('/move', cors_handler)
     app.router.add_options('/rotate', cors_handler)
     app.router.add_options('/video/start', cors_handler)

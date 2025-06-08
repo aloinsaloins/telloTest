@@ -22,6 +22,10 @@ async function executeTelloManager(action: string, options: { command?: string; 
         url = 'http://localhost:8080/api/status';
         method = 'GET';
         break;
+      case 'reset_status':
+        url = 'http://localhost:8080/api/reset_status';
+        method = 'POST';
+        break;
       case 'start_video':
         url = 'http://localhost:8080/api/video/start';
         method = 'POST';
@@ -272,6 +276,32 @@ export const telloStatusTool = createTool({
   },
 });
 
+// Tello状態リセットツール（デバッグ用）
+export const telloResetStatusTool = createTool({
+  id: "tello_reset_status",
+  description: "Telloドローンの飛行状態をリセットします（「飛行中」エラーが発生した場合のデバッグ用）",
+  inputSchema: z.object({}),
+  outputSchema: z.object({
+    success: z.boolean(),
+    message: z.string(),
+    data: z.object({
+      old_status: z.string().optional(),
+      new_status: z.string().optional(),
+    }).optional(),
+  }),
+  execute: async () => {
+    try {
+      const result = await executeTelloManager('reset_status');
+      return result;
+    } catch (error) {
+      return {
+        success: false,
+        message: `状態リセットエラー: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  },
+});
+
 // Tello緊急停止ツール（自動接続対応）
 export const telloEmergencyTool = createTool({
   id: "tello_emergency",
@@ -373,6 +403,7 @@ export const telloTools = [
   telloMoveTool,
   telloRotateTool,
   telloStatusTool,
+  telloResetStatusTool,
   telloEmergencyTool,
   telloStartVideoTool,
   telloStopVideoTool,

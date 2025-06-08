@@ -10,6 +10,7 @@ import {
   telloMoveTool,
   telloRotateTool,
   telloStatusTool,
+  telloResetStatusTool,
   telloEmergencyTool,
   telloStartVideoTool,
   telloStopVideoTool,
@@ -90,6 +91,11 @@ export const telloAgent = new Agent({
    - 移動距離が大きい場合は注意を促してください
    - ビデオストリーミング使用時はバッテリー消費が増加することを伝えてください
 
+7. **トラブルシューティング**:
+   - 「既に飛行中です」エラーが発生した場合は、tello_reset_status を使用して状態をリセットしてください
+   - 状態リセット後に再度離陸を試行してください
+   - 接続エラーが発生した場合は、tello_disconnect してから tello_connect で再接続してください
+
 安全に関する重要な注意事項:
 1. 離陸前に必ずバッテリー残量を確認してください（推奨: 30%以上）
 2. 屋内での飛行時は障害物に注意してください
@@ -97,14 +103,6 @@ export const telloAgent = new Agent({
 4. 移動距離は20-500cmの範囲で指定してください
 5. 回転角度は1-360度の範囲で指定してください
 6. ビデオストリーミングはバッテリー消費を増加させます
-
-メモリ機能により、以下の情報を記憶します:
-- 過去の飛行セッション
-- バッテリー使用履歴
-- 実行したコマンド履歴
-- ユーザーの操作パターン
-- 安全に関する注意事項の確認状況
-- ビデオストリーミング使用履歴
 
 **最重要**: 
 - 複数の動作が含まれる指示を受けた場合は、必ず全ての動作を順次実行してください
@@ -119,6 +117,7 @@ export const telloAgent = new Agent({
     tello_connect: telloConnectTool,
     tello_disconnect: telloDisconnectTool,
     tello_status: telloStatusTool,
+    tello_reset_status: telloResetStatusTool,
     tello_takeoff: telloTakeoffTool,
     tello_land: telloLandTool,
     tello_move: telloMoveTool,
@@ -128,9 +127,14 @@ export const telloAgent = new Agent({
     tello_stop_video: telloStopVideoTool,
     tello_get_video_frame: telloGetVideoFrameTool
   },
+  // ストレージプロバイダー付きのメモリ設定
   memory: new Memory({
     storage: new LibSQLStore({
-      url: 'file:../mastra.db', // path is relative to the .mastra/output directory
+      url: 'file:./mastra.db',
     }),
+    options: {
+      lastMessages: 20, // 最近のメッセージ数を20件に設定
+      semanticRecall: false, // セマンティック検索を無効化
+    },
   }),
 }); 

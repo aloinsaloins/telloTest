@@ -17,6 +17,7 @@
     "tello:ai:land": "node --import tsx/esm src/tello-natural-language.ts \"着陸して\"",
     "tello:ai:forward": "node --import tsx/esm src/tello-natural-language.ts \"前に100cm進んで\"",
     "tello:ai:rotate": "node --import tsx/esm src/tello-natural-language.ts \"右に90度回転して\"",
+    "memory:test": "tsx src/test-memory.ts",
     "web:dev": "vite",
     "web:build": "vite build",
     "web:preview": "vite preview"

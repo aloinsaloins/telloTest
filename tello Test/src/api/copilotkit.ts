@@ -10,7 +10,7 @@ export async function POST(request: Request) {
       threadId,
       resourceId,
       maxSteps: 10,
-      temperature: 0.7
+      temperature: 0.1
     });
 
     return new Response(JSON.stringify({

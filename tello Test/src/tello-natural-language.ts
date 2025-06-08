@@ -5,7 +5,7 @@ async function main() {
   const args = process.argv.slice(2);
   const userInput = args.join(' ') || 'ドローンのステータスを確認して';
 
-  console.log('🤖 Tello自然言語制御システム（永続接続対応）');
+  console.log('🤖 Tello自然言語制御システム（メモリ機能付き）');
   console.log('================================================');
   console.log(`📝 入力: "${userInput}"`);
   console.log('🔄 処理中...\n');
@@ -19,13 +19,25 @@ async function main() {
       return;
     }
 
-    // 自然言語の指示をエージェントに送信
+    // メモリ用のIDを設定
+    const resourceId = 'tello_user_001'; // ユーザーID（実際の使用では動的に設定）
+    const threadId = 'tello_session_' + new Date().toISOString().split('T')[0]; // 日付ベースのスレッドID
+
+    console.log(`👤 ユーザーID: ${resourceId}`);
+    console.log(`🔗 セッションID: ${threadId}\n`);
+
+    // 自然言語の指示をエージェントに送信（メモリ機能付き）
     const response = await agent.generate([
       {
         role: 'user',
         content: userInput,
       },
-    ]);
+    ], {
+      resourceId: resourceId,
+      threadId: threadId,
+      maxSteps: 10, // 複数ステップの実行を許可
+      temperature: 0.1, // 一貫性を向上させるため低い温度に設定
+    });
 
     console.log('🤖 エージェントの応答:');
     console.log('========================');
@@ -40,6 +52,8 @@ async function main() {
         }
       });
     }
+
+    console.log('\n✅ メモリ機能が有効です - 会話履歴が保存されました');
 
   } catch (error) {
     console.error('❌ エラーが発生しました:', error);
