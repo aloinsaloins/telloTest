@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "接続して、ストリームを開始して、離陸して、50cm前進して、元の場所に着陸して"
+    }
+  ],
+  "threadId": "test-thread-multi-sequence",
+  "resourceId": "test-user"
+} 

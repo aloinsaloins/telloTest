@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "こんにちは"
+    }
+  ],
+  "threadId": "test",
+  "resourceId": "user"
+} 

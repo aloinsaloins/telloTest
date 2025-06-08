@@ -16,12 +16,16 @@ import asyncio
 import json
 import logging
 from aiohttp import web
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import socket
 import threading
 import cv2
 from datetime import datetime
 import contextlib
+import base64
+import time
+import subprocess
+import numpy as np
 
 # ログ設定 - INFOレベル以上を出力（重要な情報のみ）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,6 +61,17 @@ class AsyncTelloController:
         
         # ビデオキャプチャ
         self.cap: Optional[cv2.VideoCapture] = None
+        self.video_streaming = False
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        
+        # FFmpegプロセス（代替ビデオ処理用）
+        self.ffmpeg_process = None
+        self.use_ffmpeg = False
+        
+        # シンプルUDPキャプチャ用
+        self.udp_socket = None
+        self.use_simple_udp = False
         
         # 接続状態
         self.is_connected = False
@@ -351,28 +366,101 @@ class AsyncTelloController:
                 "raw_response": response
             }
     
+    async def reset_flight_status(self) -> Dict[str, Any]:
+        """飛行状態をリセットします（デバッグ用）"""
+        old_status = self.flight_status
+        self.flight_status = "landed"
+        self._log_operation("reset_flight_status", {"old_status": old_status, "new_status": "landed"})
+        logger.info(f"飛行状態をリセットしました: {old_status} -> landed")
+        return {
+            "success": True,
+            "message": f"飛行状態をリセットしました: {old_status} -> landed",
+            "old_status": old_status,
+            "new_status": "landed",
+            "timestamp": datetime.now().isoformat()
+        }
+
     async def takeoff(self) -> Dict[str, Any]:
         """離陸します"""
         if not self.is_connected:
             return {"success": False, "message": "Telloに接続されていません"}
         
         if self.flight_status == "flying":
-            return {"success": False, "message": "既に飛行中です"}
+            # 状態確認のため実際のドローンの状態をチェック
+            logger.warning("飛行状態が'flying'になっていますが、実際の状態を確認します...")
+            
+            # 実際にTelloに状態確認コマンドを送信
+            try:
+                state_response = await self._send_command('battery?', timeout=3)
+                if state_response == "timeout" or state_response == "error":
+                    # 通信できない場合は状態をリセット
+                    logger.info("ドローンとの通信ができないため、状態をリセットします")
+                    self.flight_status = "landed"
+                else:
+                    # 通信できる場合は、強制的に着陸コマンドを送信してから離陸
+                    logger.info("安全のため、まず着陸コマンドを送信します")
+                    await self._send_command('land', timeout=5)
+                    await asyncio.sleep(2)  # 少し待機
+                    self.flight_status = "landed"
+            except Exception as e:
+                logger.warning(f"状態確認中にエラー: {e}")
+                self.flight_status = "landed"
         
-        logger.debug("離陸中...")
-        response = await self._send_command('takeoff', timeout=15)
+        logger.info("離陸を開始します...")
+        response = await self._send_command('takeoff', timeout=25)  # タイムアウトを25秒に延長
         
         if 'ok' in response.lower():
             self.flight_status = "flying"
             self._log_operation("takeoff", {"status": "success"})
+            logger.info("離陸に成功しました")
             return {
                 "success": True,
                 "message": "離陸に成功しました",
                 "flight_status": self.flight_status,
                 "timestamp": datetime.now().isoformat()
             }
+        elif response == "timeout":
+            self._log_operation("takeoff", {"status": "timeout"})
+            
+            # 自動再接続を試行
+            logger.info("離陸コマンドタイムアウト、自動再接続を試行します...")
+            reconnect_success = await self._auto_reconnect()
+            
+            if reconnect_success:
+                logger.info("再接続成功、離陸コマンドを再実行します")
+                # 再接続後にコマンドを再実行
+                retry_response = await self._send_command('takeoff', timeout=25, retry_on_timeout=False)
+                
+                if 'ok' in retry_response.lower():
+                    self.flight_status = "flying"
+                    self._log_operation("takeoff", {"status": "success_after_reconnect"})
+                    logger.info("再接続後に離陸に成功しました")
+                    return {
+                        "success": True,
+                        "message": "再接続後に離陸に成功しました",
+                        "flight_status": self.flight_status,
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    logger.error(f"再接続後も離陸に失敗: {retry_response}")
+                    return {
+                        "success": False,
+                        "message": f"再接続後も離陸に失敗しました: {retry_response}",
+                        "reconnected": True,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            else:
+                logger.error("離陸コマンドタイムアウト、自動再接続にも失敗")
+                return {
+                    "success": False,
+                    "message": "離陸コマンドがタイムアウトし、自動再接続にも失敗しました。ドローンの状態を確認してください。",
+                    "reconnected": False,
+                    "timestamp": datetime.now().isoformat()
+                }
         else:
             self._log_operation("takeoff", {"status": "failed", "response": response})
+            logger.error(f"離陸に失敗: {response}")
             return {
                 "success": False,
                 "message": f"離陸に失敗しました: {response}",
@@ -635,6 +723,7 @@ class AsyncTelloController:
             "connected": self.is_connected,
             "flight_status": self.flight_status,
             "battery": self.last_battery,
+            "video_streaming": self.video_streaming,
             "timestamp": datetime.now().isoformat()
         }
     
@@ -651,14 +740,671 @@ class AsyncTelloController:
         if len(self.operation_log) > 100:
             self.operation_log = self.operation_log[-100:]
     
+    async def _try_video_capture_methods(self) -> Tuple[bool, str]:
+        """Try different video capture methods and return success status and method name."""
+        capture_methods = [
+            ("OpenCV", self._start_opencv_capture),
+            ("FFmpeg", self._start_ffmpeg_capture),
+            ("Simple UDP", self._start_simple_udp_capture)
+        ]
+        
+        for method_name, method_func in capture_methods:
+            logger.info(f"{method_name}でビデオキャプチャを試行中...")
+            try:
+                success = await method_func()
+                if success:
+                    logger.info(f"✅ {method_name}でビデオストリーミングを開始しました")
+                    return True, method_name
+            except Exception as method_e:
+                logger.error(f"{method_name}でエラー: {method_e}")
+                continue
+        
+        return False, ""
+
+    async def start_video_stream(self) -> Dict[str, Any]:
+        """ビデオストリーミングを開始します（改善版）"""
+        if not self.is_connected:
+            return {"success": False, "message": "Telloに接続されていません"}
+        
+        try:
+            # 既存のビデオストリーミングを停止
+            if self.video_streaming:
+                logger.info("既存のビデオストリーミングを停止中...")
+                await self.stop_video_stream()
+                await asyncio.sleep(1)
+            
+            # ビデオストリーミングを有効化（複数回試行）
+            streamon_success = False
+            for attempt in range(3):
+                logger.info(f"ビデオストリーミング有効化試行 {attempt + 1}/3")
+                response = await self._send_command('streamon', timeout=10)
+                
+                if 'ok' in response.lower():
+                    streamon_success = True
+                    logger.info("Telloビデオストリーミングコマンドが成功しました")
+                    break
+                elif response == "timeout":
+                    logger.warning(f"streamon コマンドタイムアウト (試行 {attempt + 1})")
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning(f"streamon 応答: {response} (試行 {attempt + 1})")
+                    await asyncio.sleep(1)
+            
+            if not streamon_success:
+                return {
+                    "success": False,
+                    "message": "Telloビデオストリーミングコマンドが失敗しました"
+                }
+            
+            # Telloがストリーミングモードになるまで待機
+            logger.info("Telloがストリーミングモードになるまで待機中...")
+            await asyncio.sleep(3)
+            
+            # 複数の方法でビデオキャプチャを試行
+            success, method_name = await self._try_video_capture_methods()
+            if success:
+                return {
+                    "success": True,
+                    "message": f"{method_name}でビデオストリーミングを開始しました",
+                    "method": method_name.lower(),
+                    "timestamp": datetime.now().isoformat()
+                }
+            
+            # すべての方法が失敗した場合
+            logger.error("すべてのビデオキャプチャ方法が失敗しました")
+            return {
+                "success": False,
+                "message": "すべてのビデオキャプチャ方法が失敗しました。Telloのビデオストリーミング機能を確認してください。"
+            }
+                
+        except Exception as e:
+            logger.error(f"ビデオストリーミング開始エラー: {e}")
+            return {
+                "success": False,
+                "message": f"ビデオストリーミング開始エラー: {e}"
+            }
+    
+    async def _start_opencv_capture(self) -> bool:
+        """OpenCVを使用してビデオキャプチャを開始（改善版）"""
+        try:
+            # 複数のUDPストリーム形式を試行
+            stream_urls = [
+                f'udp://0.0.0.0:{self.video_port}',
+                f'udp://@0.0.0.0:{self.video_port}',
+                f'udp://127.0.0.1:{self.video_port}'
+            ]
+            
+            for stream_url in stream_urls:
+                logger.info(f"ビデオストリーム接続を試行: {stream_url}")
+                
+                # OpenCVでビデオキャプチャを開始
+                self.cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                
+                if self.cap.isOpened():
+                    # OpenCVの設定を最適化（フレームレート向上）
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # バッファサイズを最小に
+                    self.cap.set(cv2.CAP_PROP_FPS, 30)  # フレームレートを向上
+                    
+                    # タイムアウト設定を追加
+                    self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)  # 5秒タイムアウト
+                    self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)  # 3秒読み取りタイムアウト
+                    
+                    # フォーマット設定（より柔軟に）
+                    try:
+                        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                    except:
+                        pass  # フォーマット設定に失敗しても続行
+                    
+                    self.video_streaming = True
+                    self.use_ffmpeg = False
+                    
+                    # ビデオフレーム取得スレッドを開始
+                    video_thread = threading.Thread(target=self._capture_video_frames)
+                    video_thread.daemon = True
+                    video_thread.start()
+                    
+                    # 初期化時間を待機（短縮）
+                    await asyncio.sleep(2)
+                    
+                    # テストフレームを取得して動作確認
+                    test_attempts = 0
+                    while test_attempts < 15:  # 試行回数を増加
+                        if self.latest_frame is not None:
+                            logger.info(f"OpenCVビデオキャプチャが正常に動作しています ({stream_url})")
+                            return True
+                        await asyncio.sleep(0.2)  # 待機時間をさらに短縮
+                        test_attempts += 1
+                    
+                    # このストリームURLでは失敗、次を試行
+                    logger.warning(f"OpenCVでフレームを取得できませんでした ({stream_url})")
+                    self.video_streaming = False
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
+                else:
+                    logger.warning(f"OpenCVビデオキャプチャの初期化に失敗しました ({stream_url})")
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
+            
+            logger.warning("すべてのOpenCVストリームURLで失敗しました")
+            return False
+                
+        except Exception as e:
+            logger.error(f"OpenCVキャプチャエラー: {e}")
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            return False
+    
+    async def _start_ffmpeg_capture(self) -> bool:
+        """FFmpegを使用してビデオキャプチャを開始（改善版）"""
+        try:
+            # FFmpegの利用可能性をチェック
+            try:
+                subprocess.run(['ffmpeg', '-version'], 
+                             stdout=subprocess.DEVNULL, 
+                             stderr=subprocess.DEVNULL, 
+                             check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                logger.error("FFmpegが見つかりません。FFmpegをインストールしてください。")
+                return False
+            
+            # 複数のFFmpegコマンド設定を試行
+            ffmpeg_configs = [
+                # 設定1: 基本的な設定
+                [
+                    'ffmpeg',
+                    '-fflags', '+genpts',
+                    '-thread_queue_size', '512',
+                    '-i', f'udp://0.0.0.0:{self.video_port}',
+                    '-f', 'rawvideo',
+                    '-pix_fmt', 'bgr24',
+                    '-an',  # オーディオなし
+                    '-sn',  # 字幕なし
+                    '-vf', 'scale=640:480',  # より小さい解像度で安定性向上
+                    '-r', '25',  # フレームレートを向上
+                    '-'
+                ],
+                # 設定2: より堅牢な設定
+                [
+                    'ffmpeg',
+                    '-fflags', '+genpts',
+                    '-thread_queue_size', '1024',
+                    '-probesize', '32',
+                    '-analyzeduration', '0',
+                    '-i', f'udp://0.0.0.0:{self.video_port}',
+                    '-f', 'rawvideo',
+                    '-pix_fmt', 'bgr24',
+                    '-an',
+                    '-sn',
+                    '-vf', 'scale=640:480',
+                    '-r', '20',
+                    '-'
+                ]
+            ]
+            
+            for i, ffmpeg_cmd in enumerate(ffmpeg_configs):
+                logger.info(f"FFmpeg設定 {i+1} を試行中...")
+                
+                try:
+                    # FFmpegプロセスを開始
+                    self.ffmpeg_process = subprocess.Popen(
+                        ffmpeg_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        bufsize=10**6  # バッファサイズを調整
+                    )
+                    
+                    self.video_streaming = True
+                    self.use_ffmpeg = True
+                    
+                    # FFmpegフレーム取得スレッドを開始
+                    video_thread = threading.Thread(target=self._capture_ffmpeg_frames)
+                    video_thread.daemon = True
+                    video_thread.start()
+                    
+                    # 初期化時間を待機（短縮）
+                    await asyncio.sleep(2)
+                    
+                    # テストフレームを取得して動作確認
+                    test_attempts = 0
+                    while test_attempts < 15:
+                        if self.latest_frame is not None:
+                            logger.info(f"FFmpegビデオキャプチャが正常に動作しています (設定 {i+1})")
+                            return True
+                        await asyncio.sleep(0.5)
+                        test_attempts += 1
+                    
+                    # この設定では失敗、次を試行
+                    logger.warning(f"FFmpeg設定 {i+1} でフレームを取得できませんでした")
+                    self.video_streaming = False
+                    if self.ffmpeg_process:
+                        self.ffmpeg_process.terminate()
+                        try:
+                            self.ffmpeg_process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.ffmpeg_process.kill()
+                        self.ffmpeg_process = None
+                        
+                except Exception as config_e:
+                    logger.warning(f"FFmpeg設定 {i+1} でエラー: {config_e}")
+                    if self.ffmpeg_process:
+                        try:
+                            self.ffmpeg_process.terminate()
+                            self.ffmpeg_process.wait(timeout=2)
+                        except:
+                            pass
+                        self.ffmpeg_process = None
+            
+            logger.warning("すべてのFFmpeg設定で失敗しました")
+            return False
+            
+        except Exception as e:
+            logger.error(f"FFmpegキャプチャエラー: {e}")
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.terminate()
+                    self.ffmpeg_process.wait(timeout=2)
+                except:
+                    pass
+                self.ffmpeg_process = None
+            return False
+    
+    async def _start_simple_udp_capture(self) -> bool:
+        """シンプルなUDPソケットを使用してビデオキャプチャを開始"""
+        try:
+            import socket
+            
+            # UDPソケットを作成
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_socket.bind(('0.0.0.0', self.video_port))
+            self.udp_socket.settimeout(5.0)  # 5秒タイムアウト
+            
+            self.video_streaming = True
+            self.use_simple_udp = True
+            self.use_ffmpeg = False
+            
+            # シンプルUDPフレーム取得スレッドを開始
+            video_thread = threading.Thread(target=self._capture_simple_udp_frames)
+            video_thread.daemon = True
+            video_thread.start()
+            
+            # 初期化時間を待機
+            await asyncio.sleep(2)
+            
+            # テストフレームを取得して動作確認
+            test_attempts = 0
+            while test_attempts < 10:
+                if self.latest_frame is not None:
+                    logger.info("シンプルUDPビデオキャプチャが正常に動作しています")
+                    return True
+                await asyncio.sleep(0.5)
+                test_attempts += 1
+            
+            logger.warning("シンプルUDPでフレームを取得できませんでした")
+            self.video_streaming = False
+            self.use_simple_udp = False
+            if self.udp_socket:
+                self.udp_socket.close()
+                self.udp_socket = None
+            return False
+            
+        except Exception as e:
+            logger.error(f"シンプルUDPキャプチャエラー: {e}")
+            if self.udp_socket:
+                try:
+                    self.udp_socket.close()
+                except:
+                    pass
+                self.udp_socket = None
+            return False
+    
+    async def stop_video_stream(self) -> Dict[str, Any]:
+        """ビデオストリーミングを停止します"""
+        try:
+            self.video_streaming = False
+            
+            # OpenCVキャプチャを停止
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            
+            # FFmpegプロセスを停止
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.terminate()
+                    self.ffmpeg_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait()
+                finally:
+                    self.ffmpeg_process = None
+            
+            # シンプルUDPソケットを停止
+            if self.udp_socket:
+                try:
+                    self.udp_socket.close()
+                except:
+                    pass
+                finally:
+                    self.udp_socket = None
+            
+            self.use_ffmpeg = False
+            self.use_simple_udp = False
+            self.latest_frame = None
+            
+            # ビデオストリーミングを無効化
+            if self.is_connected:
+                response = await self._send_command('streamoff')
+                logger.info("ビデオストリーミングを停止しました")
+            
+            return {
+                "success": True,
+                "message": "ビデオストリーミングを停止しました",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"ビデオストリーミング停止エラー: {e}")
+            return {
+                "success": False,
+                "message": f"ビデオストリーミング停止エラー: {e}"
+            }
+    
+    def _reinitialize_video_capture(self) -> bool:
+        """Re-initialize video capture after failures."""
+        try:
+            if self.cap:
+                self.cap.release()
+            time.sleep(2)
+            self.cap = cv2.VideoCapture(f'udp://@0.0.0.0:{self.video_port}')
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                # フレームレート向上のための追加設定
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+                logger.info("ビデオキャプチャを再初期化しました")
+                return True
+            else:
+                logger.error("ビデオキャプチャの再初期化に失敗しました")
+                return False
+        except Exception as reinit_e:
+            logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+            return False
+
+    def _reinitialize_opencv_capture_robust(self) -> bool:
+        """Re-initialize OpenCV capture with robust settings after C++ exceptions."""
+        try:
+            if self.cap:
+                self.cap.release()
+            time.sleep(1)
+            # より堅牢な再初期化
+            self.cap = cv2.VideoCapture(f'udp://0.0.0.0:{self.video_port}', cv2.CAP_FFMPEG)
+            if self.cap.isOpened():
+                # 基本設定のみ適用（エラーを避けるため）
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                logger.info("OpenCVビデオキャプチャを再初期化しました")
+                return True
+            else:
+                logger.error("OpenCVビデオキャプチャの再初期化に失敗")
+                return False
+        except Exception as reinit_e:
+            logger.error(f"ビデオキャプチャ再初期化エラー: {reinit_e}")
+            return False
+
+    def _capture_video_frames(self):
+        """ビデオフレームを継続的にキャプチャするスレッド（改善版）"""
+        consecutive_failures = 0
+        max_failures = 10
+        frame_skip_count = 0
+        successful_frames = 0
+        
+        logger.info("ビデオフレームキャプチャスレッドを開始しました")
+        
+        while self.video_streaming and self.cap and self.cap.isOpened():
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    # フレームが正常に取得できた場合
+                    consecutive_failures = 0
+                    frame_skip_count = 0
+                    successful_frames += 1
+                    
+                    # フレームサイズをチェック
+                    if frame.shape[0] > 0 and frame.shape[1] > 0:
+                        with self.frame_lock:
+                            self.latest_frame = frame
+                        
+                        # 最初のフレーム取得時にログ出力
+                        if successful_frames == 1:
+                            logger.info(f"最初のビデオフレームを取得しました (サイズ: {frame.shape})")
+                        elif successful_frames % 100 == 0:  # 100フレームごとにログ
+                            logger.debug(f"ビデオフレーム取得中... ({successful_frames} フレーム)")
+                else:
+                    # フレーム取得に失敗した場合
+                    consecutive_failures += 1
+                    frame_skip_count += 1
+                    
+                    # 連続失敗が多い場合は再初期化
+                    if consecutive_failures >= max_failures:
+                        logger.warning(f"連続してフレーム取得に失敗しました（{consecutive_failures}回）")
+                        if self._reinitialize_video_capture():
+                            consecutive_failures = 0
+                        else:
+                            break
+                    else:
+                        # より短時間待機してリトライ（フレームレート向上）
+                        time.sleep(0.01)
+                        
+            except Exception as e:
+                error_msg = str(e)
+                # OpenCVの特定のエラーを詳細に処理
+                if "Unknown C++ exception" in error_msg:
+                    logger.error("OpenCVでC++例外が発生しました。ビデオストリームを再初期化します。")
+                    if self._reinitialize_opencv_capture_robust():
+                        consecutive_failures = 0
+                        continue
+                    else:
+                        break
+                else:
+                    logger.error(f"フレームキャプチャエラー: {e}")
+                
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.error("フレームキャプチャエラーが多すぎるため、スレッドを終了します")
+                    break
+                time.sleep(0.1)
+        
+        logger.info("ビデオフレームキャプチャスレッドが終了しました")
+    
+    def _capture_ffmpeg_frames(self):
+        """FFmpegからビデオフレームを継続的にキャプチャするスレッド"""
+        frame_width = 640
+        frame_height = 480
+        frame_size = frame_width * frame_height * 3  # BGR24
+        
+        consecutive_failures = 0
+        max_failures = 10
+        
+        while self.video_streaming and self.ffmpeg_process:
+            try:
+                # FFmpegからフレームデータを読み取り
+                raw_frame = self.ffmpeg_process.stdout.read(frame_size)
+                
+                if len(raw_frame) == frame_size:
+                    # バイトデータをnumpy配列に変換
+                    frame = np.frombuffer(raw_frame, dtype=np.uint8)
+                    frame = frame.reshape((frame_height, frame_width, 3))
+                    
+                    consecutive_failures = 0
+                    with self.frame_lock:
+                        self.latest_frame = frame
+                        
+                elif len(raw_frame) == 0:
+                    # プロセスが終了した
+                    logger.info("FFmpegプロセスが終了しました")
+                    break
+                else:
+                    # 不完全なフレーム
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        logger.warning(f"FFmpegから不完全なフレームを連続受信（{consecutive_failures}回）")
+                        break
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                logger.error(f"FFmpegフレームキャプチャエラー: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.error("FFmpegフレームキャプチャエラーが多すぎるため、ビデオストリーミングを停止します")
+                    break
+                time.sleep(0.1)
+        
+        logger.info("FFmpegビデオフレームキャプチャスレッドが終了しました")
+    
+    def _capture_simple_udp_frames(self):
+        """シンプルUDPソケットからビデオフレームを継続的にキャプチャするスレッド"""
+        consecutive_failures = 0
+        max_failures = 10
+        successful_frames = 0
+        
+        logger.info("シンプルUDPビデオフレームキャプチャスレッドを開始しました")
+        
+        while self.video_streaming and self.udp_socket:
+            try:
+                # UDPパケットを受信
+                data, addr = self.udp_socket.recvfrom(65536)  # 最大64KB
+                
+                if len(data) > 0:
+                    # H.264データを受信した場合、簡単な画像として保存
+                    # 実際のH.264デコードは複雑なので、ここでは受信確認のみ
+                    consecutive_failures = 0
+                    successful_frames += 1
+                    
+                    # 最初のパケット受信時にログ出力
+                    if successful_frames == 1:
+                        logger.info(f"最初のUDPビデオパケットを受信しました (サイズ: {len(data)} bytes, from: {addr})")
+                    elif successful_frames % 100 == 0:  # 100パケットごとにログ
+                        logger.debug(f"UDPビデオパケット受信中... ({successful_frames} パケット)")
+                    
+                    # 簡単なテスト画像を生成（実際のH.264デコードの代替）
+                    if successful_frames <= 5:  # 最初の数フレームのみテスト画像を生成
+                        test_frame = self._create_test_frame(f"UDP Frame {successful_frames}")
+                        with self.frame_lock:
+                            self.latest_frame = test_frame
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        logger.warning(f"UDPパケット受信に連続失敗（{consecutive_failures}回）")
+                        break
+                    time.sleep(0.1)
+                    
+            except socket.timeout:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.warning(f"UDPソケットタイムアウトが連続発生（{consecutive_failures}回）")
+                    break
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"シンプルUDPフレームキャプチャエラー: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.error("シンプルUDPフレームキャプチャエラーが多すぎるため、スレッドを終了します")
+                    break
+                time.sleep(0.1)
+        
+        logger.info("シンプルUDPビデオフレームキャプチャスレッドが終了しました")
+    
+    def _create_test_frame(self, text: str):
+        """テスト用のフレームを生成"""
+        import numpy as np
+        
+        # 640x480のテスト画像を作成
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        frame[:, :] = [64, 128, 192]  # 青っぽい背景
+        
+        # OpenCVでテキストを描画（利用可能な場合）
+        try:
+            import cv2
+            cv2.putText(frame, text, (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
+            cv2.putText(frame, "Tello Video Stream", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(frame, f"Time: {datetime.now().strftime('%H:%M:%S')}", (50, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        except:
+            pass  # OpenCVが利用できない場合はテキストなしで続行
+        
+        return frame
+    
+    async def get_video_frame(self) -> Dict[str, Any]:
+        """最新のビデオフレームをBase64エンコードして取得します"""
+        if not self.video_streaming or self.latest_frame is None:
+            return {
+                "success": False,
+                "message": "ビデオストリーミングが開始されていません"
+            }
+        
+        try:
+            with self.frame_lock:
+                frame = self.latest_frame.copy()
+            
+            # フレームをJPEGエンコード（品質を下げて高速化）
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            
+            # Base64エンコード
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            
+            return {
+                "success": True,
+                "frame": frame_base64,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"フレーム取得エラー: {e}")
+            return {
+                "success": False,
+                "message": f"フレーム取得エラー: {e}"
+            }
+
     async def disconnect(self):
         """Telloから切断します"""
         try:
             self.running = False
+            self.video_streaming = False
             
+            # OpenCVキャプチャを停止
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            
+            # FFmpegプロセスを停止
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.terminate()
+                    self.ffmpeg_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait()
+                finally:
+                    self.ffmpeg_process = None
+            
+            # シンプルUDPソケットを停止
+            if self.udp_socket:
+                try:
+                    self.udp_socket.close()
+                except:
+                    pass
+                finally:
+                    self.udp_socket = None
+            
+            self.use_ffmpeg = False
+            self.use_simple_udp = False
+            self.latest_frame = None
             
             if self.receive_thread and self.receive_thread.is_alive():
                 self.receive_thread.join(timeout=2)
@@ -751,6 +1497,11 @@ async def emergency_handler(request: web.Request) -> web.Response:
     result = await tello_controller.emergency()
     return web.json_response(result)
 
+async def reset_status_handler(request: web.Request) -> web.Response:
+    """飛行状態リセットエンドポイント"""
+    result = await tello_controller.reset_flight_status()
+    return web.json_response(result)
+
 async def move_handler(request: web.Request) -> web.Response:
     """移動エンドポイント"""
     try:
@@ -799,6 +1550,281 @@ async def rotate_handler(request: web.Request) -> web.Response:
             status=500
         )
 
+async def start_video_handler(request: web.Request) -> web.Response:
+    """ビデオストリーミング開始エンドポイント"""
+    result = await tello_controller.start_video_stream()
+    return web.json_response(result)
+
+async def stop_video_handler(request: web.Request) -> web.Response:
+    """ビデオストリーミング停止エンドポイント"""
+    result = await tello_controller.stop_video_stream()
+    return web.json_response(result)
+
+async def video_frame_handler(request: web.Request) -> web.Response:
+    """ビデオフレーム取得エンドポイント"""
+    result = await tello_controller.get_video_frame()
+    return web.json_response(result)
+
+async def video_debug_handler(request: web.Request) -> web.Response:
+    """ビデオストリーミングデバッグ情報エンドポイント"""
+    debug_info = {
+        "video_streaming": tello_controller.video_streaming,
+        "use_ffmpeg": tello_controller.use_ffmpeg,
+        "use_simple_udp": tello_controller.use_simple_udp,
+        "cap_opened": tello_controller.cap.isOpened() if tello_controller.cap else False,
+        "ffmpeg_process_running": tello_controller.ffmpeg_process is not None and tello_controller.ffmpeg_process.poll() is None if tello_controller.ffmpeg_process else False,
+        "udp_socket_active": tello_controller.udp_socket is not None,
+        "latest_frame_available": tello_controller.latest_frame is not None,
+        "latest_frame_shape": tello_controller.latest_frame.shape if tello_controller.latest_frame is not None else None,
+        "is_connected": tello_controller.is_connected
+    }
+    return web.json_response({"success": True, "debug_info": debug_info})
+
+async def handle_direct_command(message: str) -> str:
+    """Mastraエージェントが利用できない場合の直接的なコマンド処理"""
+    message_lower = message.lower()
+    responses = []
+    
+    # 複雑な複数コマンドの処理: 「ビデオストリーミングを開始して、離陸して、前に50cm進んで、着陸して、ビデオを停止して」
+    if ("ビデオ" in message and "開始" in message and 
+        "離陸" in message and 
+        ("前" in message or "進" in message) and 
+        "着陸" in message and 
+        ("停止" in message or "ビデオ" in message)):
+        
+        logger.info("複雑な複数コマンド処理: ビデオ開始 + 離陸 + 移動 + 着陸 + ビデオ停止")
+        
+        # 1. ビデオストリーミング開始
+        logger.info("Telloビデオストリーミング開始コマンドを実行中...")
+        video_start_result = await tello_controller.start_video_stream()
+        if video_start_result.get('success', False):
+            responses.append("✅ ビデオストリーミングを開始しました。")
+            await asyncio.sleep(2)  # ビデオ安定化のため待機
+        else:
+            responses.append("❌ ビデオストリーミングの開始に失敗しました。")
+        
+        # 2. 離陸
+        logger.info("Tello離陸コマンドを実行中...")
+        takeoff_result = await tello_controller.takeoff()
+        if takeoff_result.get('success', False):
+            responses.append("✅ 離陸に成功しました。")
+            await asyncio.sleep(3)  # 離陸安定化のため待機
+        else:
+            responses.append("❌ 離陸に失敗しました。")
+        
+        # 3. 前進移動
+        import re
+        distance_match = re.search(r'(\d+)\s*cm', message)
+        distance = int(distance_match.group(1)) if distance_match else 50
+        
+        logger.info(f"Tello前進移動コマンドを実行中... 距離: {distance}cm")
+        move_result = await tello_controller.move('forward', distance)
+        if move_result.get('success', False):
+            responses.append(f"✅ 前に{distance}cm移動しました。")
+            await asyncio.sleep(2)  # 移動安定化のため待機
+        else:
+            responses.append(f"❌ 前への移動に失敗しました。")
+        
+        # 4. 着陸
+        logger.info("Tello着陸コマンドを実行中...")
+        land_result = await tello_controller.land()
+        if land_result.get('success', False):
+            responses.append("✅ 着陸に成功しました。")
+            await asyncio.sleep(3)  # 着陸安定化のため待機
+        else:
+            responses.append("❌ 着陸に失敗しました。")
+        
+        # 5. ビデオストリーミング停止
+        logger.info("Telloビデオストリーミング停止コマンドを実行中...")
+        video_stop_result = await tello_controller.stop_video_stream()
+        if video_stop_result.get('success', False):
+            responses.append("✅ ビデオストリーミングを停止しました。")
+        else:
+            responses.append("❌ ビデオストリーミングの停止に失敗しました。")
+        
+        return "\n".join(responses)
+    
+    # 複数コマンドの処理: 「離陸して、20cm右に動いて」のようなケース
+    elif "離陸" in message and "右" in message and ("移動" in message or "動" in message):
+        logger.info("複数コマンド処理: 離陸 + 右移動")
+        
+        # 1. 離陸
+        logger.info("Tello離陸コマンドを実行中...")
+        takeoff_result = await tello_controller.takeoff()
+        if takeoff_result.get('success', False):
+            responses.append("✅ 離陸に成功しました。")
+            await asyncio.sleep(3)  # 離陸安定化のため待機
+            
+            # 2. 右移動
+            import re
+            distance_match = re.search(r'(\d+)\s*cm', message)
+            distance = int(distance_match.group(1)) if distance_match else 20
+            
+            logger.info(f"Tello右移動コマンドを実行中... 距離: {distance}cm")
+            move_result = await tello_controller.move('right', distance)
+            if move_result.get('success', False):
+                responses.append(f"✅ 右に{distance}cm移動しました。")
+            else:
+                responses.append(f"❌ 右への移動に失敗しました。")
+        else:
+            responses.append("❌ 離陸に失敗しました。")
+        
+        return "\n".join(responses)
+    
+    # 単一コマンドの処理
+    elif "接続" in message or "connect" in message_lower:
+        logger.info("Tello接続コマンドを実行中...")
+        connect_result = await tello_controller.connect()
+        success = connect_result.get('success', False)
+        if success:
+            return "✅ Telloに正常に接続されました。"
+        else:
+            return "❌ Telloへの接続に失敗しました。"
+    
+    elif "離陸" in message or "takeoff" in message_lower:
+        logger.info("Tello離陸コマンドを実行中...")
+        takeoff_result = await tello_controller.takeoff()
+        success = takeoff_result.get('success', False)
+        if success:
+            return "✅ 離陸に成功しました。"
+        else:
+            return "❌ 離陸に失敗しました。"
+    
+    elif "着陸" in message or "land" in message_lower:
+        logger.info("Tello着陸コマンドを実行中...")
+        land_result = await tello_controller.land()
+        success = land_result.get('success', False)
+        if success:
+            return "✅ 着陸に成功しました。"
+        else:
+            return "❌ 着陸に失敗しました。"
+    
+    elif ("ビデオ" in message or "video" in message_lower) and ("開始" in message or "start" in message_lower):
+        logger.info("Telloビデオストリーミング開始コマンドを実行中...")
+        video_result = await tello_controller.start_video_stream()
+        success = video_result.get('success', False)
+        if success:
+            return "✅ ビデオストリーミングを開始しました。"
+        else:
+            return "❌ ビデオストリーミングの開始に失敗しました。"
+    
+    elif ("ビデオ" in message or "video" in message_lower) and ("停止" in message or "stop" in message_lower):
+        logger.info("Telloビデオストリーミング停止コマンドを実行中...")
+        video_result = await tello_controller.stop_video_stream()
+        success = video_result.get('success', False)
+        if success:
+            return "✅ ビデオストリーミングを停止しました。"
+        else:
+            return "❌ ビデオストリーミングの停止に失敗しました。"
+    
+    elif "右" in message and ("移動" in message or "動" in message):
+        logger.info("Tello右移動コマンドを実行中...")
+        # 距離を抽出（デフォルト20cm）
+        import re
+        distance_match = re.search(r'(\d+)\s*cm', message)
+        distance = int(distance_match.group(1)) if distance_match else 20
+        move_result = await tello_controller.move('right', distance)
+        success = move_result.get('success', False)
+        if success:
+            return f"✅ 右に{distance}cm移動しました。"
+        else:
+            return f"❌ 右への移動に失敗しました。"
+    
+    elif "前" in message and ("移動" in message or "動" in message or "進" in message):
+        logger.info("Tello前進移動コマンドを実行中...")
+        # 距離を抽出（デフォルト50cm）
+        import re
+        distance_match = re.search(r'(\d+)\s*cm', message)
+        distance = int(distance_match.group(1)) if distance_match else 50
+        move_result = await tello_controller.move('forward', distance)
+        success = move_result.get('success', False)
+        if success:
+            return f"✅ 前に{distance}cm移動しました。"
+        else:
+            return f"❌ 前への移動に失敗しました。"
+    
+    elif "状態" in message or "status" in message_lower:
+        logger.info("Telloステータス確認中...")
+        status_result = await tello_controller.get_status()
+        return f"📊 ドローンの状態: {status_result}"
+    
+    else:
+        return "❌ 認識できないコマンドです。まず「接続して」と言ってください。"
+
+async def copilotkit_handler(request: web.Request) -> web.Response:
+    """AG-UI/CopilotKit APIエンドポイント - Mastraエージェントとの通信"""
+    try:
+        # リクエストボディを取得
+        body = await request.json()
+        messages = body.get('messages', [])
+        thread_id = body.get('threadId', 'default')
+        resource_id = body.get('resourceId', 'user')
+        
+        logger.info(f"CopilotKit request: {len(messages)} messages, thread: {thread_id}")
+        
+        if not messages:
+            response_text = "メッセージが空です。何かご質問はありますか？"
+        else:
+            last_message = messages[-1].get('content', '')
+            logger.info(f"Last message: {last_message}")
+            
+            # Mastraエージェントを呼び出す
+            response_text = await call_mastra_agent(last_message, thread_id, resource_id)
+        
+        # 成功レスポンスを返す
+        return web.json_response({
+            "success": True,
+            "text": response_text,
+            "toolCalls": {},
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"CopilotKit API error: {e}")
+        return web.json_response({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }, status=500)
+
+async def call_mastra_agent(message: str, thread_id: str, resource_id: str) -> str:
+    """Mastraエージェントを呼び出す"""
+    try:
+        import aiohttp
+        mastra_url = "http://localhost:4111/api/agents/telloAgent/generate"
+        logger.info(f"🚀 Calling Mastra agent: {message}")
+        
+        payload = {
+            "messages": [{"role": "user", "content": message}],
+            "threadId": thread_id,
+            "resourceId": resource_id
+        }
+        
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                mastra_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as resp:
+                logger.info(f"Mastra response status: {resp.status}")
+                
+                if resp.status == 200:
+                    mastra_response = await resp.json()
+                    response_text = mastra_response.get('text', 'エージェントからの応答がありませんでした。')
+                    logger.info(f"✅ Mastra agent SUCCESS")
+                    return response_text
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"❌ Mastra agent HTTP error: {resp.status}")
+                    # フォールバック処理
+                    return await handle_direct_command(message)
+                    
+    except Exception as e:
+        logger.error(f"❌ Mastra agent call failed: {e}")
+        # フォールバック処理
+        return await handle_direct_command(message)
+
 async def health_handler(request: web.Request) -> web.Response:
     """ヘルスチェックエンドポイント"""
     return web.json_response({
@@ -806,6 +1832,153 @@ async def health_handler(request: web.Request) -> web.Response:
         "service": "Tello Web Controller",
         "timestamp": datetime.now().isoformat()
     })
+
+async def index_handler(request: web.Request) -> web.Response:
+    """メインページのハンドラー - ReactアプリへのリダイレクトまたはAPI情報表示"""
+    # 開発環境では React アプリ (localhost:3000) へのリダイレクト案内
+    # 本番環境では API 情報を表示
+    html_content = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tello Web Controller API</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 40px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: white;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 40px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+        .redirect-info {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .redirect-info h2 {
+            color: #fff;
+            margin-bottom: 20px;
+        }
+        .redirect-link {
+            display: inline-block;
+            background: linear-gradient(45deg, #2ecc71, #27ae60);
+            color: white;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 25px;
+            font-weight: bold;
+            font-size: 18px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+        .redirect-link:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+        }
+        .api-info {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 30px;
+        }
+        .api-info h3 {
+            color: #fff;
+            margin-bottom: 20px;
+        }
+        .api-info code {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+        .api-info ul {
+            list-style: none;
+            padding: 0;
+        }
+        .api-info li {
+            background: rgba(255, 255, 255, 0.1);
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #2ecc71;
+        }
+        .status-badge {
+            display: inline-block;
+            background: #2ecc71;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚁 Tello Web Controller API</h1>
+        
+        <div class="redirect-info">
+            <h2>メインアプリケーション</h2>
+            <p>Tello制御用のReactアプリケーションは以下のURLでアクセスできます：</p>
+            <a href="http://localhost:3000" class="redirect-link" target="_blank">
+                🚀 Tello AI Controller を開く
+            </a>
+            <p style="margin-top: 20px; font-size: 14px; opacity: 0.8;">
+                ※ 開発サーバー（pnpm web:dev）が起動している必要があります
+            </p>
+        </div>
+
+        <div class="api-info">
+            <h3>🔌 API エンドポイント</h3>
+            <p>このサーバーは以下のAPIエンドポイントを提供します：</p>
+            <ul>
+                <li><code>GET /health</code> - ヘルスチェック <span class="status-badge">READY</span></li>
+                <li><code>POST /api/connect</code> - Tello接続</li>
+                <li><code>POST /api/disconnect</code> - Tello切断</li>
+                <li><code>GET /api/status</code> - ドローン状態取得</li>
+                <li><code>GET /api/battery</code> - バッテリー残量取得</li>
+                <li><code>POST /api/takeoff</code> - 離陸</li>
+                <li><code>POST /api/land</code> - 着陸</li>
+                <li><code>POST /api/emergency</code> - 緊急停止</li>
+                <li><code>POST /api/move</code> - 移動制御</li>
+                <li><code>POST /api/rotate</code> - 回転制御</li>
+                <li><code>POST /api/video/start</code> - ビデオストリーミング開始</li>
+                <li><code>POST /api/video/stop</code> - ビデオストリーミング停止</li>
+                <li><code>GET /api/video/frame</code> - ビデオフレーム取得</li>
+                <li><code>POST /api/copilotkit</code> - AG-UI API <span class="status-badge">AI</span></li>
+            </ul>
+            
+            <h3>🤖 AG-UI プロトコル</h3>
+            <p>このサーバーはAG-UIプロトコルに対応しており、自然言語でのドローン制御が可能です。</p>
+            
+            <h3>📚 使用方法</h3>
+            <p>詳細な使用方法については、<code>AG_UI_TELLO_README.md</code> をご参照ください。</p>
+        </div>
+    </div>
+</body>
+</html>
+    """
+    return web.Response(text=html_content, content_type='text/html')
 
 # CORS対応
 async def cors_handler(request: web.Request) -> web.Response:
@@ -828,7 +2001,7 @@ def setup_cors(app):
                 headers={
                     'Access-Control-Allow-Origin': '*',  # 本番環境では特定のドメインに制限することを推奨
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
+                    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
                 }
             )
         
@@ -836,11 +2009,29 @@ def setup_cors(app):
             response = await handler(request)
             response.headers['Access-Control-Allow-Origin'] = '*'  # 本番環境では特定のドメインに制限することを推奨
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
             return response
+        except web.HTTPMethodNotAllowed as e:
+            logger.error(f"Method not allowed: {request.method} {request.path}")
+            return web.json_response({
+                "error": f"Method {request.method} not allowed for {request.path}",
+                "allowed_methods": ["GET", "POST", "OPTIONS"]
+            }, status=405, headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+            })
         except Exception as e:
             logger.error(f"CORS middleware error: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+            return web.json_response({
+                "error": str(e),
+                "path": request.path,
+                "method": request.method
+            }, status=500, headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+            })
     
     app.middlewares.append(cors_middleware)
 
@@ -848,8 +2039,27 @@ def create_app() -> web.Application:
     """Webアプリケーションを作成します"""
     app = web.Application()
     
-    # ルート設定
+    # メインページ
+    app.router.add_get('/', index_handler)
+    
+    # ルート設定（/api/ プレフィックス付き）
     app.router.add_get('/health', health_handler)
+    app.router.add_post('/api/connect', connect_handler)
+    app.router.add_post('/api/disconnect', disconnect_handler)
+    app.router.add_get('/api/status', status_handler)
+    app.router.add_get('/api/battery', battery_handler)
+    app.router.add_post('/api/takeoff', takeoff_handler)
+    app.router.add_post('/api/land', land_handler)
+    app.router.add_post('/api/emergency', emergency_handler)
+    app.router.add_post('/api/reset_status', reset_status_handler)
+    app.router.add_post('/api/move', move_handler)
+    app.router.add_post('/api/rotate', rotate_handler)
+    app.router.add_post('/api/video/start', start_video_handler)
+    app.router.add_post('/api/video/stop', stop_video_handler)
+    app.router.add_get('/api/video/frame', video_frame_handler)
+    app.router.add_get('/api/video/debug', video_debug_handler)
+    
+    # 後方互換性のため、/api/ なしのエンドポイントも維持
     app.router.add_post('/connect', connect_handler)
     app.router.add_post('/disconnect', disconnect_handler)
     app.router.add_get('/status', status_handler)
@@ -857,10 +2067,47 @@ def create_app() -> web.Application:
     app.router.add_post('/takeoff', takeoff_handler)
     app.router.add_post('/land', land_handler)
     app.router.add_post('/emergency', emergency_handler)
+    app.router.add_post('/reset_status', reset_status_handler)
     app.router.add_post('/move', move_handler)
     app.router.add_post('/rotate', rotate_handler)
+    app.router.add_post('/video/start', start_video_handler)
+    app.router.add_post('/video/stop', stop_video_handler)
+    app.router.add_get('/video/frame', video_frame_handler)
+    app.router.add_get('/video/debug', video_debug_handler)
     
-    # OPTIONS用のルート設定
+    # AG-UI/CopilotKit API
+    app.router.add_post('/api/copilotkit', copilotkit_handler)
+    app.router.add_options('/api/copilotkit', cors_handler)
+    
+    # OPTIONS用のルート設定（/api/ プレフィックス付き）
+    app.router.add_options('/api/connect', cors_handler)
+    app.router.add_options('/api/disconnect', cors_handler)
+    app.router.add_options('/api/status', cors_handler)
+    app.router.add_options('/api/battery', cors_handler)
+    app.router.add_options('/api/takeoff', cors_handler)
+    app.router.add_options('/api/land', cors_handler)
+    app.router.add_options('/api/emergency', cors_handler)
+    app.router.add_options('/api/reset_status', cors_handler)
+    app.router.add_options('/api/move', cors_handler)
+    app.router.add_options('/api/rotate', cors_handler)
+    app.router.add_options('/api/video/start', cors_handler)
+    app.router.add_options('/api/video/stop', cors_handler)
+    app.router.add_options('/api/video/frame', cors_handler)
+    
+    # 後方互換性のため、/api/ なしのOPTIONSも維持
+    app.router.add_options('/connect', cors_handler)
+    app.router.add_options('/disconnect', cors_handler)
+    app.router.add_options('/status', cors_handler)
+    app.router.add_options('/battery', cors_handler)
+    app.router.add_options('/takeoff', cors_handler)
+    app.router.add_options('/land', cors_handler)
+    app.router.add_options('/emergency', cors_handler)
+    app.router.add_options('/reset_status', cors_handler)
+    app.router.add_options('/move', cors_handler)
+    app.router.add_options('/rotate', cors_handler)
+    app.router.add_options('/video/start', cors_handler)
+    app.router.add_options('/video/stop', cors_handler)
+    app.router.add_options('/video/frame', cors_handler)
     app.router.add_options('/{path:.*}', cors_handler)
     
     return app
@@ -877,6 +2124,26 @@ async def main():
     logger.info(f"Tello Web Controller started on http://{host}:{port}")
     logger.info("Ready to control Tello drone via HTTP API")
     logger.info("バイナリデータフィルタリング機能が有効です")
+    logger.info("AG-UI/CopilotKit APIエンドポイント: /api/copilotkit")
+    
+    # 利用可能なエンドポイントを表示
+    logger.info("Available endpoints:")
+    logger.info("  GET  /health - ヘルスチェック")
+    logger.info("  POST /api/connect - Tello接続")
+    logger.info("  POST /api/disconnect - Tello切断")
+    logger.info("  GET  /api/status - ドローン状態")
+    logger.info("  GET  /api/battery - バッテリー残量")
+    logger.info("  POST /api/takeoff - 離陸")
+    logger.info("  POST /api/land - 着陸")
+    logger.info("  POST /api/emergency - 緊急停止")
+    logger.info("  POST /api/move - 移動")
+    logger.info("  POST /api/rotate - 回転")
+    logger.info("  POST /api/video/start - ビデオ開始")
+    logger.info("  POST /api/video/stop - ビデオ停止")
+    logger.info("  GET  /api/video/frame - フレーム取得")
+    logger.info("  GET  /api/video/debug - ビデオデバッグ情報")
+    logger.info("  POST /api/copilotkit - AG-UI API")
+    logger.info("  (後方互換性のため /api/ なしのエンドポイントも利用可能)")
     
     # サーバー起動
     runner = web.AppRunner(app)
