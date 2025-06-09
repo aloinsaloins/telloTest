@@ -1,5 +1,0 @@
-{
-  "message": "Telloに接続して、ビデオストリーミングを開始して、離陸して、前に30cm進んで、着陸して、ビデオストリーミングを停止してください",
-  "thread_id": "test_complete_video",
-  "resource_id": "tello_complete_test"
-} 
