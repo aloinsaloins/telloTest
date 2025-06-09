@@ -95,7 +95,12 @@ class AsyncTelloController:
             # ソケット初期化
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.local_ip, self.local_port))
+            try:
+                self.socket.bind((self.local_ip, self.local_port))
+            except OSError as e:
+                logger.error(f"ソケットバインドに失敗しました (port {self.local_port}): {e}")
+                self.socket.close()
+                raise ConnectionError(f"ポート {self.local_port} の使用に失敗しました: {e}")
             
             # 応答受信スレッド開始
             self.running = True
@@ -173,7 +178,11 @@ class AsyncTelloController:
                         break
                 
                 # コマンド送信
-                self.socket.sendto(command.encode('utf-8'), (self.tello_ip, self.tello_port))
+                try:
+                    self.socket.sendto(command.encode('utf-8'), (self.tello_ip, self.tello_port))
+                except OSError as e:
+                    logger.error(f"UDP送信エラー: {e}")
+                    return "network_error"
                 
                 # 応答を待機（非同期）
                 try:
@@ -1017,10 +1026,17 @@ class AsyncTelloController:
             import socket
             
             # UDPソケットを作成
-            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.udp_socket.bind(('0.0.0.0', self.video_port))
-            self.udp_socket.settimeout(5.0)  # 5秒タイムアウト
+            try:
+                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.udp_socket.bind(('0.0.0.0', self.video_port))
+                self.udp_socket.settimeout(5.0)  # 5秒タイムアウト
+            except OSError as e:
+                logger.error(f"ビデオUDPソケットバインドに失敗: {e}")
+                if self.udp_socket:
+                    self.udp_socket.close()
+                    self.udp_socket = None
+                return False
             
             self.video_streaming = True
             self.use_simple_udp = True
@@ -1631,18 +1647,32 @@ async def call_mastra_agent(message: str, thread_id: str, resource_id: str) -> s
     
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            mastra_url,
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        ) as resp:
-            logger.info(f"Mastra response status: {resp.status}")
-            
-            if resp.status == 200:
-                mastra_response = await resp.json()
-                response_text = mastra_response.get('text', 'エージェントからの応答がありませんでした。')
-                logger.info(f"✅ Mastra agent SUCCESS")
-                return response_text
+        try:
+            async with session.post(
+                mastra_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as resp:
+                logger.info(f"Mastra response status: {resp.status}")
+                
+                if resp.status == 200:
+                    mastra_response = await resp.json()
+                    response_text = mastra_response.get('text', 'エージェントからの応答がありませんでした。')
+                    logger.info(f"✅ Mastra agent SUCCESS")
+                    return response_text
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"Mastra agent error {resp.status}: {error_text}")
+                    return f"エージェントエラー（状態コード: {resp.status}）"
+        except aiohttp.ClientError as e:
+            logger.error(f"Mastra agent network error: {e}")
+            return "エージェントとの通信に失敗しました。ネットワーク接続を確認してください。"
+        except asyncio.TimeoutError:
+            logger.error("Mastra agent timeout")
+            return "エージェントからの応答がタイムアウトしました。"
+        except Exception as e:
+            logger.error(f"Mastra agent unexpected error: {e}")
+            return "エージェントで予期しないエラーが発生しました。"
                     
 
 
@@ -1659,7 +1689,7 @@ async def cors_handler(request: web.Request) -> web.Response:
     """CORS preflight対応"""
     return web.Response(
         headers={
-            'Access-Control-Allow-Origin': '*',  # 本番環境では特定のドメインに制限することを推奨
+            'Access-Control-Allow-Origin': 'http://localhost:3000',  # 開発環境用、本番では適切なドメインを設定
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type',
         }
@@ -1673,7 +1703,7 @@ def setup_cors(app):
         if request.method == 'OPTIONS':
             return web.Response(
                 headers={
-                    'Access-Control-Allow-Origin': '*',  # 本番環境では特定のドメインに制限することを推奨
+                    'Access-Control-Allow-Origin': 'http://localhost:3000',  # 開発環境用、本番では適切なドメインを設定
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
                 }
@@ -1681,7 +1711,7 @@ def setup_cors(app):
         
         try:
             response = await handler(request)
-            response.headers['Access-Control-Allow-Origin'] = '*'  # 本番環境では特定のドメインに制限することを推奨
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'  # 開発環境用、本番では適切なドメインを設定
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
             response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
             return response
@@ -1691,7 +1721,7 @@ def setup_cors(app):
                 "error": f"Method {request.method} not allowed for {request.path}",
                 "allowed_methods": ["GET", "POST", "OPTIONS"]
             }, status=405, headers={
-                'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': 'http://localhost:3000',  # 開発環境用、本番では適切なドメインを設定
                 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                 'Access-Control-Allow-Headers': 'Content-Type, Authorization'
             })
@@ -1702,7 +1732,7 @@ def setup_cors(app):
                 "path": request.path,
                 "method": request.method
             }, status=500, headers={
-                'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': 'http://localhost:3000',  # 開発環境用、本番では適切なドメインを設定
                 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                 'Access-Control-Allow-Headers': 'Content-Type, Authorization'
             })

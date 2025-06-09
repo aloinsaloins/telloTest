@@ -25,6 +25,8 @@ pip install -r requirements.txt
 ## 📁 ファイル構成
 
 - `tello_connection.py` - メインのTello制御クラス
+- `tello_connection_manager.py` - Tello接続管理モジュール
+- `tello_web_server.py` - Webサーバーインターフェース
 - `tello_example.py` - 使用例とデモプログラム
 - `requirements.txt` - 必要なPythonライブラリ
 - `TELLO_README.md` - このファイル
@@ -95,6 +97,8 @@ finally:
 ## 📹 ビデオストリーム
 
 ```python
+import cv2
+
 # ビデオストリーム開始
 if tello.start_video_stream():
     while True:
