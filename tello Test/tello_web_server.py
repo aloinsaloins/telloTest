@@ -1580,177 +1580,6 @@ async def video_debug_handler(request: web.Request) -> web.Response:
     }
     return web.json_response({"success": True, "debug_info": debug_info})
 
-async def handle_direct_command(message: str) -> str:
-    """Mastraエージェントが利用できない場合の直接的なコマンド処理"""
-    message_lower = message.lower()
-    responses = []
-    
-    # 複雑な複数コマンドの処理: 「ビデオストリーミングを開始して、離陸して、前に50cm進んで、着陸して、ビデオを停止して」
-    if ("ビデオ" in message and "開始" in message and 
-        "離陸" in message and 
-        ("前" in message or "進" in message) and 
-        "着陸" in message and 
-        ("停止" in message or "ビデオ" in message)):
-        
-        logger.info("複雑な複数コマンド処理: ビデオ開始 + 離陸 + 移動 + 着陸 + ビデオ停止")
-        
-        # 1. ビデオストリーミング開始
-        logger.info("Telloビデオストリーミング開始コマンドを実行中...")
-        video_start_result = await tello_controller.start_video_stream()
-        if video_start_result.get('success', False):
-            responses.append("✅ ビデオストリーミングを開始しました。")
-            await asyncio.sleep(2)  # ビデオ安定化のため待機
-        else:
-            responses.append("❌ ビデオストリーミングの開始に失敗しました。")
-        
-        # 2. 離陸
-        logger.info("Tello離陸コマンドを実行中...")
-        takeoff_result = await tello_controller.takeoff()
-        if takeoff_result.get('success', False):
-            responses.append("✅ 離陸に成功しました。")
-            await asyncio.sleep(3)  # 離陸安定化のため待機
-        else:
-            responses.append("❌ 離陸に失敗しました。")
-        
-        # 3. 前進移動
-        import re
-        distance_match = re.search(r'(\d+)\s*cm', message)
-        distance = int(distance_match.group(1)) if distance_match else 50
-        
-        logger.info(f"Tello前進移動コマンドを実行中... 距離: {distance}cm")
-        move_result = await tello_controller.move('forward', distance)
-        if move_result.get('success', False):
-            responses.append(f"✅ 前に{distance}cm移動しました。")
-            await asyncio.sleep(2)  # 移動安定化のため待機
-        else:
-            responses.append(f"❌ 前への移動に失敗しました。")
-        
-        # 4. 着陸
-        logger.info("Tello着陸コマンドを実行中...")
-        land_result = await tello_controller.land()
-        if land_result.get('success', False):
-            responses.append("✅ 着陸に成功しました。")
-            await asyncio.sleep(3)  # 着陸安定化のため待機
-        else:
-            responses.append("❌ 着陸に失敗しました。")
-        
-        # 5. ビデオストリーミング停止
-        logger.info("Telloビデオストリーミング停止コマンドを実行中...")
-        video_stop_result = await tello_controller.stop_video_stream()
-        if video_stop_result.get('success', False):
-            responses.append("✅ ビデオストリーミングを停止しました。")
-        else:
-            responses.append("❌ ビデオストリーミングの停止に失敗しました。")
-        
-        return "\n".join(responses)
-    
-    # 複数コマンドの処理: 「離陸して、20cm右に動いて」のようなケース
-    elif "離陸" in message and "右" in message and ("移動" in message or "動" in message):
-        logger.info("複数コマンド処理: 離陸 + 右移動")
-        
-        # 1. 離陸
-        logger.info("Tello離陸コマンドを実行中...")
-        takeoff_result = await tello_controller.takeoff()
-        if takeoff_result.get('success', False):
-            responses.append("✅ 離陸に成功しました。")
-            await asyncio.sleep(3)  # 離陸安定化のため待機
-            
-            # 2. 右移動
-            import re
-            distance_match = re.search(r'(\d+)\s*cm', message)
-            distance = int(distance_match.group(1)) if distance_match else 20
-            
-            logger.info(f"Tello右移動コマンドを実行中... 距離: {distance}cm")
-            move_result = await tello_controller.move('right', distance)
-            if move_result.get('success', False):
-                responses.append(f"✅ 右に{distance}cm移動しました。")
-            else:
-                responses.append(f"❌ 右への移動に失敗しました。")
-        else:
-            responses.append("❌ 離陸に失敗しました。")
-        
-        return "\n".join(responses)
-    
-    # 単一コマンドの処理
-    elif "接続" in message or "connect" in message_lower:
-        logger.info("Tello接続コマンドを実行中...")
-        connect_result = await tello_controller.connect()
-        success = connect_result.get('success', False)
-        if success:
-            return "✅ Telloに正常に接続されました。"
-        else:
-            return "❌ Telloへの接続に失敗しました。"
-    
-    elif "離陸" in message or "takeoff" in message_lower:
-        logger.info("Tello離陸コマンドを実行中...")
-        takeoff_result = await tello_controller.takeoff()
-        success = takeoff_result.get('success', False)
-        if success:
-            return "✅ 離陸に成功しました。"
-        else:
-            return "❌ 離陸に失敗しました。"
-    
-    elif "着陸" in message or "land" in message_lower:
-        logger.info("Tello着陸コマンドを実行中...")
-        land_result = await tello_controller.land()
-        success = land_result.get('success', False)
-        if success:
-            return "✅ 着陸に成功しました。"
-        else:
-            return "❌ 着陸に失敗しました。"
-    
-    elif ("ビデオ" in message or "video" in message_lower) and ("開始" in message or "start" in message_lower):
-        logger.info("Telloビデオストリーミング開始コマンドを実行中...")
-        video_result = await tello_controller.start_video_stream()
-        success = video_result.get('success', False)
-        if success:
-            return "✅ ビデオストリーミングを開始しました。"
-        else:
-            return "❌ ビデオストリーミングの開始に失敗しました。"
-    
-    elif ("ビデオ" in message or "video" in message_lower) and ("停止" in message or "stop" in message_lower):
-        logger.info("Telloビデオストリーミング停止コマンドを実行中...")
-        video_result = await tello_controller.stop_video_stream()
-        success = video_result.get('success', False)
-        if success:
-            return "✅ ビデオストリーミングを停止しました。"
-        else:
-            return "❌ ビデオストリーミングの停止に失敗しました。"
-    
-    elif "右" in message and ("移動" in message or "動" in message):
-        logger.info("Tello右移動コマンドを実行中...")
-        # 距離を抽出（デフォルト20cm）
-        import re
-        distance_match = re.search(r'(\d+)\s*cm', message)
-        distance = int(distance_match.group(1)) if distance_match else 20
-        move_result = await tello_controller.move('right', distance)
-        success = move_result.get('success', False)
-        if success:
-            return f"✅ 右に{distance}cm移動しました。"
-        else:
-            return f"❌ 右への移動に失敗しました。"
-    
-    elif "前" in message and ("移動" in message or "動" in message or "進" in message):
-        logger.info("Tello前進移動コマンドを実行中...")
-        # 距離を抽出（デフォルト50cm）
-        import re
-        distance_match = re.search(r'(\d+)\s*cm', message)
-        distance = int(distance_match.group(1)) if distance_match else 50
-        move_result = await tello_controller.move('forward', distance)
-        success = move_result.get('success', False)
-        if success:
-            return f"✅ 前に{distance}cm移動しました。"
-        else:
-            return f"❌ 前への移動に失敗しました。"
-    
-    elif "状態" in message or "status" in message_lower:
-        logger.info("Telloステータス確認中...")
-        status_result = await tello_controller.get_status()
-        return f"📊 ドローンの状態: {status_result}"
-    
-    else:
-        return "❌ 認識できないコマンドです。まず「接続して」と言ってください。"
-
 async def copilotkit_handler(request: web.Request) -> web.Response:
     """AG-UI/CopilotKit APIエンドポイント - Mastraエージェントとの通信"""
     try:
@@ -1789,41 +1618,33 @@ async def copilotkit_handler(request: web.Request) -> web.Response:
 
 async def call_mastra_agent(message: str, thread_id: str, resource_id: str) -> str:
     """Mastraエージェントを呼び出す"""
-    try:
-        import aiohttp
-        mastra_url = "http://localhost:4111/api/agents/telloAgent/generate"
-        logger.info(f"🚀 Calling Mastra agent: {message}")
-        
-        payload = {
-            "messages": [{"role": "user", "content": message}],
-            "threadId": thread_id,
-            "resourceId": resource_id
-        }
-        
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                mastra_url,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                logger.info(f"Mastra response status: {resp.status}")
-                
-                if resp.status == 200:
-                    mastra_response = await resp.json()
-                    response_text = mastra_response.get('text', 'エージェントからの応答がありませんでした。')
-                    logger.info(f"✅ Mastra agent SUCCESS")
-                    return response_text
-                else:
-                    error_text = await resp.text()
-                    logger.error(f"❌ Mastra agent HTTP error: {resp.status}")
-                    # フォールバック処理
-                    return await handle_direct_command(message)
+
+    import aiohttp
+    mastra_url = "http://localhost:4111/api/agents/telloAgent/generate"
+    logger.info(f"🚀 Calling Mastra agent: {message}")
+    
+    payload = {
+        "messages": [{"role": "user", "content": message}],
+        "threadId": thread_id,
+        "resourceId": resource_id
+    }
+    
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            mastra_url,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        ) as resp:
+            logger.info(f"Mastra response status: {resp.status}")
+            
+            if resp.status == 200:
+                mastra_response = await resp.json()
+                response_text = mastra_response.get('text', 'エージェントからの応答がありませんでした。')
+                logger.info(f"✅ Mastra agent SUCCESS")
+                return response_text
                     
-    except Exception as e:
-        logger.error(f"❌ Mastra agent call failed: {e}")
-        # フォールバック処理
-        return await handle_direct_command(message)
+
 
 async def health_handler(request: web.Request) -> web.Response:
     """ヘルスチェックエンドポイント"""
